@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/mcpshield-core",
+    "crates/mcpshield-db",
+    "crates/mcpshield-policy-sql",
+    "crates/mcpshield-desktop",
+]
+resolver = "2"
