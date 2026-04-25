@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// Coarse-grained rule: applies to all tools in an integration for an agent.
+/// Tool-level rules take precedence over this when both are present.
+/// Evaluation order: tool-level → integration-level → default deny.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationPermission {
+    pub effect: ToolEffect,
+}
+
+/// Fine-grained rule: applies to a specific tool within an integration.
+/// Overrides any IntegrationPermission for the same (agent, integration) pair.
+/// `tool_name` is the local name without the integration slug prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolPermission {
     pub tool_name: String,
@@ -9,7 +20,13 @@ pub struct ToolPermission {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolEffect {
+    /// Agent may call this tool. Appears in tools/list.
     Allow,
+    /// Tool exists in the integration but is not enabled for this agent.
+    /// Excluded from tools/list; surfaced via mcpshield__list_available_tools.
+    /// Desktop does not use this variant — binary Allow/Deny only.
+    Discoverable,
+    /// Agent has no visibility of this tool. Silent absence from all responses.
     Deny,
 }
 
