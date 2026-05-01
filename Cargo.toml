@@ -3,6 +3,6 @@ members = [
     "crates/mcpshield-core",
     "crates/mcpshield-db",
     "crates/mcpshield-policy-sql",
-    "crates/mcpshield-desktop",
+    "crates/mcpshield-standard",
 ]
 resolver = "2"

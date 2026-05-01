@@ -1,5 +1,5 @@
 [package]
-name = "mcpshield-desktop"
+name = "mcpshield-standard"
 version = "0.1.0"
 edition = "2024"
 
@@ -20,5 +20,5 @@ thiserror = "2"
 anyhow = "1"
 argon2 = "0.5"
 ring = "0.17"
-keyring = "3"
 rcgen = "0.13"
+instant-acme = "0.7"
