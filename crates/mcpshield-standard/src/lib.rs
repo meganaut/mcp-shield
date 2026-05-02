@@ -1,8 +1,12 @@
+pub mod admin;
 pub mod config;
+pub mod crypto;
 pub mod downstream;
 pub mod handler;
 pub mod noop;
-pub mod session;
+pub mod oauth;
 pub mod server;
+pub mod session;
+pub mod setup;
 #[cfg(feature = "tls")]
 pub mod tls;

@@ -2,7 +2,8 @@
 members = [
     "crates/mcpshield-core",
     "crates/mcpshield-db",
-    "crates/mcpshield-policy-sql",
+    "crates/mcpshield-db-sqlite",
+    "crates/mcpshield-policy-db",
     "crates/mcpshield-standard",
     "crates/mcpshield-test-support",
 ]

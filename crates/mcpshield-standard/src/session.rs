@@ -9,7 +9,8 @@ const MAX_SESSIONS: usize = 1000;
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
-    // TODO M2: add agent_id and per-session downstream routing info here
+    /// The OAuth agent_id (UUID string) associated with this session.
+    pub agent_id: String,
     pub created_at: Instant,
 }
 
@@ -21,7 +22,7 @@ pub fn new_store() -> SessionStore {
 
 /// Create a new session. Purges expired sessions first, then enforces the max-count
 /// limit. Returns the new session ID, or an error if the store is at capacity.
-pub fn create_session(store: &SessionStore) -> Result<String, &'static str> {
+pub fn create_session(store: &SessionStore, agent_id: String) -> Result<String, &'static str> {
     let now = Instant::now();
     store.retain(|_, s| now.duration_since(s.created_at) < SESSION_TTL);
 
@@ -34,6 +35,7 @@ pub fn create_session(store: &SessionStore) -> Result<String, &'static str> {
         id.clone(),
         Session {
             id: id.clone(),
+            agent_id,
             created_at: now,
         },
     );

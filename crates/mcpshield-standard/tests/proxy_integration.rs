@@ -5,7 +5,10 @@ use axum::Router;
 use mcpshield_core::mcp::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, Tool, SUPPORTED_PROTOCOL_VERSION,
 };
-use mcpshield_standard::handler::{mcp_handler, AppState};
+use mcpshield_db::Store;
+use mcpshield_standard::handler::{
+    mcp_handler_no_auth, new_pending_store, new_rate_limiter, new_setup_csrf_token, AppState,
+};
 use mcpshield_standard::noop::{NoopAudit, NoopPolicy};
 use mcpshield_standard::session::new_store;
 use mcpshield_standard::downstream::DownstreamClient;
@@ -13,19 +16,34 @@ use mcpshield_test_support::MockMcpServer;
 use serde_json::json;
 use tokio::net::TcpListener;
 
+/// Create an in-memory SQLite DB with migrations applied.
+async fn make_test_db() -> Arc<dyn mcpshield_db::Store> {
+    let store = mcpshield_db_sqlite::SqliteStore::open(":memory:")
+        .await
+        .expect("open in-memory db");
+    store.run_migrations().await.expect("run migrations");
+    Arc::new(store) as Arc<dyn mcpshield_db::Store>
+}
+
 async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
     let downstream = Arc::new(DownstreamClient::new(mock_url, slug.to_string()));
     downstream.initialize().await.expect("downstream init");
+
+    let db = make_test_db().await;
 
     let state = Arc::new(AppState {
         sessions: new_store(),
         downstream,
         policy: Arc::new(NoopPolicy),
         audit: Arc::new(NoopAudit),
+        db,
+        pending_auth: new_pending_store(),
+        rate_limiter: new_rate_limiter(),
+        setup_csrf_token: new_setup_csrf_token(),
     });
 
     let app = Router::new()
-        .route("/mcp", post(mcp_handler))
+        .route("/mcp", post(mcp_handler_no_auth))
         .with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -97,9 +115,6 @@ async fn test_initialize_accepted() {
 
 #[tokio::test]
 async fn test_initialize_version_negotiated() {
-    // When client sends an unsupported version, the server responds with its own
-    // supported version rather than hard-rejecting. The client can then decide
-    // whether to proceed.
     let mock = MockMcpServer::start(vec![]).await;
     let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
 
@@ -228,7 +243,6 @@ async fn test_tools_call_unknown_slug() {
 
 #[tokio::test]
 async fn test_tools_call_known_slug_unknown_tool() {
-    // Correct slug, but the local tool name doesn't exist on the downstream.
     let mock = MockMcpServer::start(vec![]).await;
     let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
 
@@ -252,7 +266,6 @@ async fn test_tools_call_known_slug_unknown_tool() {
 
 #[tokio::test]
 async fn test_tools_call_no_namespace_separator() {
-    // Tool name with no __ separator at all should be rejected.
     let mock = MockMcpServer::start(vec![]).await;
     let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
 

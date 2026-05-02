@@ -64,10 +64,52 @@ A multi-user, organisation-scale edition built on the same core.
 |-----------|------------|
 | Gateway core | Rust, Axum, Tokio |
 | Web UI | HTMX, Askama (server-rendered, no JS framework) |
-| Database | SQLite via sqlx |
+| Database | SQLite (desktop) / PostgreSQL (enterprise) via sqlx |
 | Credential encryption | AES-256-GCM |
 | TLS | rustls |
 | Static assets | Embedded via rust-embed |
+
+## Crate architecture
+
+MCPShield is structured as a Cargo workspace with strict abstraction boundaries. Each crate depends only on traits, never on concrete implementations — concrete types are wired together only at the composition root (`server.rs`).
+
+```
+mcpshield-core
+  MCP protocol types, JsonRpc types
+  Traits: PolicyEngine, AuditSink
+  No I/O deps
+
+mcpshield-db
+  Trait: Store (all persistence operations)
+  Data types: OAuthClient, AuthCode, AccessToken, PolicyRule
+  No database deps — pure Rust
+
+mcpshield-db-sqlite
+  SqliteStore: impl Store
+  Owns all sqlx queries and SQLite migrations
+  SQLite-specific; swap for mcpshield-db-pg to target PostgreSQL
+
+mcpshield-db-pg  (future)
+  PostgresStore: impl Store
+  Drop-in replacement for enterprise deployments
+
+mcpshield-policy-db
+  DbPolicyEngine: impl PolicyEngine
+  Calls store.get_policy_rule() — no SQL, no DB dep
+  Depends only on mcpshield-core + mcpshield-db (traits)
+
+mcpshield-standard
+  Axum handlers, OAuth2/PKCE server, MCP proxy
+  Holds Arc<dyn Store> + Arc<dyn PolicyEngine> in AppState
+  No sqlx, no knowledge of SQLite or PostgreSQL
+  server.rs is the composition root: the only place that
+  imports mcpshield-db-sqlite and mcpshield-policy-db
+
+mcpshield-test-support
+  Mock MCP server for integration tests
+```
+
+This means adding a PostgreSQL backend, an OPA-based policy engine, or a DynamoDB audit sink is a matter of adding a new crate — no changes to `mcpshield-standard` or `mcpshield-core`.
 
 ## Status
 

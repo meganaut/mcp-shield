@@ -1,0 +1,9 @@
+[package]
+name = "mcpshield-policy-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mcpshield-core = { path = "../mcpshield-core" }
+mcpshield-db = { path = "../mcpshield-db" }
+serde_json = "1"
