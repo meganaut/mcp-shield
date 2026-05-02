@@ -12,6 +12,7 @@ use mcpshield_standard::downstream::DownstreamClient;
 use mcpshield_standard::handler::{
     mcp_handler_authenticated, new_pending_store, new_rate_limiter, new_setup_csrf_token, AppState,
 };
+use std::net::SocketAddr;
 use mcpshield_standard::noop::NoopAudit;
 use mcpshield_standard::oauth::authorize::{get_authorize, post_authorize};
 use mcpshield_standard::oauth::dcr::post_register;
@@ -56,7 +57,9 @@ async fn start_gateway(tools: Vec<Tool>) -> (String, Arc<dyn Store>) {
 
     let db = make_db("http://localhost").await;
 
-    let downstream = Arc::new(DownstreamClient::new(mock.url(), "fs".to_string()));
+    let downstream = Arc::new(
+        DownstreamClient::new(mock.url(), "fs".to_string()).expect("build downstream"),
+    );
     downstream.initialize().await.expect("downstream init");
 
     let policy = Arc::new(DbPolicyEngine::new(Arc::clone(&db)));
@@ -69,6 +72,7 @@ async fn start_gateway(tools: Vec<Tool>) -> (String, Arc<dyn Store>) {
         db: Arc::clone(&db),
         pending_auth: new_pending_store(),
         rate_limiter: new_rate_limiter(),
+        admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
     });
 
@@ -88,7 +92,12 @@ async fn start_gateway(tools: Vec<Tool>) -> (String, Arc<dyn Store>) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
         drop(mock); // Keep mock alive
     });
 

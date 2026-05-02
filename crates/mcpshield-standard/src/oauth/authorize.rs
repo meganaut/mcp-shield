@@ -13,7 +13,7 @@ use serde::Deserialize;
 use mcpshield_db::AuthCode;
 
 use crate::crypto::{random_base64url, unix_timestamp_secs};
-use crate::handler::{extract_client_ip, AppState, PendingAuthRequest};
+use crate::handler::{extract_client_ip, AppState, PeerIp, PendingAuthRequest};
 
 const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 
@@ -24,7 +24,7 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 /// OAuth `state` parameter length cap — prevents large in-memory entries
 const MAX_STATE_BYTES: usize = 1024;
 
-/// S256 code_challenge is always base64url(SHA-256(verifier)) = 43 chars
+/// S256 code_challenge is always base64url(SHA-256(verifier)) = 43 bytes
 const CODE_CHALLENGE_LEN: usize = 43;
 
 static LOGIN_FORM: &str = r#"<!DOCTYPE html>
@@ -111,10 +111,13 @@ pub async fn get_authorize(
         return redirect_with_error(&redirect_uri, "invalid_request", query.state.as_deref());
     }
 
-    // Validate code_challenge: S256 challenge is always base64url(SHA-256) = 43 chars
+    // Validate code_challenge using byte lengths for consistency — S256 output is always 43 ASCII bytes.
     let code_challenge = match &query.code_challenge {
-        Some(c) if c.len() == CODE_CHALLENGE_LEN
-            && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') =>
+        Some(c)
+            if c.len() == CODE_CHALLENGE_LEN
+                && c.bytes().all(|b| {
+                    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')
+                }) =>
         {
             c.clone()
         }
@@ -134,7 +137,9 @@ pub async fn get_authorize(
     let request_id = random_base64url(16);
     let now = unix_timestamp_secs();
 
-    // Purge stale entries, then enforce global cap to prevent DoS
+    // Purge stale entries then enforce the cap. The retain+len+insert is not atomic
+    // under concurrent requests, so the effective max is MAX_PENDING_ENTRIES + concurrent_tasks.
+    // This is acceptable given the 10-minute TTL and the benign nature of the overshoot.
     state.pending_auth.retain(|_, v| now - v.created_at < PENDING_TTL_SECS);
     if state.pending_auth.len() >= MAX_PENDING_ENTRIES {
         return redirect_with_error(&redirect_uri, "temporarily_unavailable", Some(&state_param));
@@ -152,7 +157,6 @@ pub async fn get_authorize(
         },
     );
 
-    // Render login form with security headers
     let html = LOGIN_FORM
         .replace("{CLIENT_NAME}", &html_escape(&client_name))
         .replace("{REQUEST_ID}", &html_escape(&request_id))
@@ -165,7 +169,7 @@ pub async fn get_authorize(
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
         .body(axum::body::Body::from(html))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,19 +181,17 @@ pub struct AuthorizeForm {
 
 pub async fn post_authorize(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
+    PeerIp(peer_ip): PeerIp,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
     let now = unix_timestamp_secs();
-    let ip = extract_client_ip(&headers);
+    let ip = extract_client_ip(peer_ip);
 
-    // Rate-limit failed attempts before any work is done
     if !state.rate_limiter.allow(&ip, now) {
         return (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
     }
 
-    // Atomically consume the pending entry — prevents two concurrent submissions
-    // from both obtaining valid auth codes from a single login gesture.
     let pending = match state.pending_auth.remove(&form.request_id) {
         Some((_, p)) if now - p.created_at < PENDING_TTL_SECS => p,
         Some(_) | None => {
@@ -197,13 +199,11 @@ pub async fn post_authorize(
         }
     };
 
-    // Cap password length before Argon2 to prevent long-input DoS
     if form.password.len() > MAX_PASSWORD_BYTES {
         state.rate_limiter.record_failure(&ip, now);
         return render_auth_error(&state, &pending, now).await;
     }
 
-    // Load admin credentials
     let stored_username = match state.db.get_setup_value("admin_username").await {
         Ok(Some(u)) => u,
         _ => {
@@ -217,8 +217,6 @@ pub async fn post_authorize(
         }
     };
 
-    // Hash both usernames to a fixed length so the comparison is constant-time
-    // regardless of whether the input lengths differ.
     use sha2::{Digest, Sha256};
     let username_ok = constant_time_eq::constant_time_eq(
         Sha256::digest(form.username.as_bytes()).as_slice(),
@@ -238,7 +236,6 @@ pub async fn post_authorize(
 
     state.rate_limiter.record_success(&ip);
 
-    // Issue auth code
     let code = random_base64url(32);
     let expires_at = now + 600;
 
@@ -259,7 +256,6 @@ pub async fn post_authorize(
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }
 
-    // Build the redirect — use '&' if redirect_uri already has a query component
     let location = append_query_params(
         &pending.redirect_uri,
         &[("code", &code), ("state", &pending.state)],
@@ -292,8 +288,7 @@ fn append_query_params(base: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// On credential failure: re-insert a fresh pending entry so the user can retry
-/// without restarting the entire OAuth flow. The new entry preserves all OAuth
-/// parameters from the original but gets a new request_id and fresh created_at.
+/// without restarting the entire OAuth flow.
 async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, now: i64) -> Response {
     let name = state
         .db
@@ -302,7 +297,6 @@ async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, 
         .unwrap_or_default()
         .unwrap_or_default();
 
-    // Re-insert a fresh pending entry so the rendered form is usable
     let new_request_id = random_base64url(16);
     state.pending_auth.insert(
         new_request_id.clone(),
@@ -328,7 +322,7 @@ async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, 
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
         .body(axum::body::Body::from(html))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 pub fn html_escape(s: &str) -> String {

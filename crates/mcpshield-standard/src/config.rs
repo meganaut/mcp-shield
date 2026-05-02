@@ -37,11 +37,17 @@ impl Default for Config {
 }
 
 fn validate_config(config: &Config) -> anyhow::Result<()> {
-    if config.downstream.slug.contains("__") {
+    let slug = &config.downstream.slug;
+    if slug.is_empty() {
+        anyhow::bail!("downstream slug must not be empty");
+    }
+    if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         anyhow::bail!(
-            "downstream slug must not contain '__': {}",
-            config.downstream.slug
+            "downstream slug must contain only alphanumeric characters, '-', or '_': {slug}"
         );
+    }
+    if slug.contains("__") {
+        anyhow::bail!("downstream slug must not contain '__': {slug}");
     }
     Ok(())
 }

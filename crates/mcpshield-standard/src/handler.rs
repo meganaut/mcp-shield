@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -21,6 +24,9 @@ use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
 use crate::session::{create_session, get_session, SessionStore};
 
+/// Maximum length for an Mcp-Session-Id header value. UUIDv4 is 36 chars; 128 is generous.
+const MAX_SESSION_ID_BYTES: usize = 128;
+
 /// A pending authorization request stored in-memory until user submits credentials.
 #[derive(Debug, Clone)]
 pub struct PendingAuthRequest {
@@ -40,8 +46,10 @@ pub fn new_pending_store() -> PendingAuthStore {
 
 /// Per-IP sliding-window rate limiter for credential-checking endpoints.
 /// Tracks timestamps of recent failures; rejects when the count in the window exceeds the cap.
+/// Note: the allow/record_failure pair is not atomic, so the effective limit under concurrent
+/// load is approximately RATE_MAX_FAILURES × tokio-worker-count. This is a known and accepted
+/// trade-off for a DashMap-based implementation.
 pub struct RateLimiter {
-    // IP -> list of failure timestamps within the window
     failures: DashMap<String, Vec<i64>>,
 }
 
@@ -73,7 +81,6 @@ impl RateLimiter {
     /// Record one failed attempt. Prunes stale entries from this IP.
     /// Also evicts fully-stale IPs when the global map exceeds RATE_MAX_ENTRIES.
     pub fn record_failure(&self, ip: &str, now: i64) {
-        // Global eviction when the map is too large
         if self.failures.len() >= RATE_MAX_ENTRIES {
             self.failures
                 .retain(|_, v| v.iter().any(|&ts| now - ts < RATE_WINDOW_SECS));
@@ -95,30 +102,42 @@ pub fn new_rate_limiter() -> RateLimiterStore {
     Arc::new(RateLimiter::new())
 }
 
-/// Extract the best-available client IP from headers (X-Forwarded-For or fallback).
-pub fn extract_client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Extract the real peer IP from the ConnectInfo extension set by axum or the TLS accept loop.
+/// Never trusts X-Forwarded-For — that header is trivially spoofable by any client.
+pub fn extract_client_ip(peer_ip: Option<IpAddr>) -> String {
+    peer_ip.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Axum extractor that reads the peer IP from the ConnectInfo extension.
+/// Returns None when ConnectInfo is not present (e.g. in unit tests).
+#[derive(Debug, Clone)]
+pub struct PeerIp(pub Option<IpAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        Ok(PeerIp(ip))
+    }
 }
 
 pub struct AppState {
     pub sessions: SessionStore,
     pub downstream: Arc<DownstreamClient>,
-    /// Policy engine — M1: always-allow no-op. M2 wires in SqlPolicyEngine.
     pub policy: Arc<dyn PolicyEngine>,
-    /// Audit sink — M1: no-op. M2 wires in structured JSON logger.
     pub audit: Arc<dyn AuditSink>,
-    /// Database handle.
     pub db: Arc<dyn Store>,
-    /// In-memory store of pending OAuth authorization requests.
     pub pending_auth: PendingAuthStore,
-    /// Per-IP rate limiter for credential-checking endpoints.
+    /// Rate limiter for OAuth credential endpoints (authorize, token).
     pub rate_limiter: RateLimiterStore,
-    /// CSRF token for the setup wizard form — generated once at startup.
+    /// Separate rate limiter for admin endpoints — success on OAuth must not reset admin failures.
+    pub admin_rate_limiter: RateLimiterStore,
     pub setup_csrf_token: String,
 }
 
@@ -133,12 +152,13 @@ pub struct AuthenticatedAgent {
     pub client_id: String,
 }
 
+/// Unauthenticated MCP handler — **test use only**. Do not register as a production route;
+/// doing so bypasses bearer-token enforcement.
 pub async fn mcp_handler_no_auth(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
-    // Compute is_notification first — it governs whether we may send any response at all.
     let is_notification = req.id.is_none();
 
     if req.jsonrpc != "2.0" {
@@ -160,7 +180,6 @@ pub async fn mcp_handler_no_auth(
             handle_initialize(state, &headers, req).await
         }
         "notifications/initialized" => {
-            // Notifications must not receive a meaningful response per spec.
             let sid = headers
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
@@ -176,9 +195,11 @@ pub async fn mcp_handler_no_auth(
             notification_ack()
         }
         method => {
+            // Cap session-id header before doing any DashMap work to prevent large-allocation DoS.
             let session_id = headers
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
+                .filter(|s| s.len() <= MAX_SESSION_ID_BYTES)
                 .map(|s| s.to_string());
 
             let session_id = match session_id {
@@ -190,7 +211,7 @@ pub async fn mcp_handler_no_auth(
                     return error_json(error_response(
                         req.id.clone(),
                         ERR_INVALID_REQUEST,
-                        "missing Mcp-Session-Id header",
+                        "missing or oversized Mcp-Session-Id header",
                     ));
                 }
             };
@@ -243,7 +264,7 @@ pub async fn authenticate_bearer(
                 .body(axum::body::Body::from(
                     r#"{"error":"unauthorized","error_description":"Bearer token required"}"#,
                 ))
-                .unwrap());
+                .expect("valid static response"));
         }
     };
 
@@ -262,7 +283,7 @@ pub async fn authenticate_bearer(
             .body(axum::body::Body::from(
                 r#"{"error":"invalid_token","error_description":"Token invalid or expired"}"#,
             ))
-            .unwrap()),
+            .expect("valid static response")),
         Err(e) => {
             tracing::error!(err = %e, "bearer auth: db error");
             Err(axum::http::Response::builder()
@@ -271,7 +292,7 @@ pub async fn authenticate_bearer(
                 .body(axum::body::Body::from(
                     r#"{"error":"server_error","error_description":"internal server error"}"#,
                 ))
-                .unwrap())
+                .expect("valid static response"))
         }
     }
 }
@@ -291,7 +312,6 @@ pub async fn mcp_handler_authenticated(
     headers: HeaderMap,
     Json(req): Json<JsonRpcRequest>,
 ) -> Response {
-    // Authenticate the bearer token
     let agent = match authenticate_bearer(&state, &headers).await {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -336,6 +356,7 @@ pub async fn mcp_handler_authenticated(
             let session_id = headers
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
+                .filter(|s| s.len() <= MAX_SESSION_ID_BYTES)
                 .map(|s| s.to_string());
 
             let session_id = match session_id {
@@ -347,7 +368,7 @@ pub async fn mcp_handler_authenticated(
                     return error_json(error_response(
                         req.id.clone(),
                         ERR_INVALID_REQUEST,
-                        "missing Mcp-Session-Id header",
+                        "missing or oversized Mcp-Session-Id header",
                     ));
                 }
             };
@@ -366,7 +387,6 @@ pub async fn mcp_handler_authenticated(
                 }
             };
 
-            // Verify the token's agent_id matches the session's agent_id
             if session.agent_id != agent.agent_id {
                 return error_json(error_response(
                     req.id,
@@ -395,7 +415,6 @@ pub async fn mcp_handler_authenticated(
 }
 
 async fn handle_initialize(state: Arc<AppState>, headers: &HeaderMap, req: JsonRpcRequest) -> Response {
-    // For the unauthenticated path (e.g. tests with NoopPolicy), use a nil agent_id
     handle_initialize_with_agent(state, headers, req, Uuid::nil().to_string()).await
 }
 
@@ -440,7 +459,6 @@ async fn handle_initialize_with_agent(
             "protocol version mismatch — responding with server version"
         );
     }
-    let negotiated_version = SUPPORTED_PROTOCOL_VERSION;
 
     let mut capabilities = state.downstream.capabilities().await;
     if let Some(obj) = capabilities.as_object_mut() {
@@ -448,7 +466,7 @@ async fn handle_initialize_with_agent(
     }
 
     let result = InitializeResult {
-        protocol_version: negotiated_version.to_string(),
+        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_string(),
         capabilities,
         server_info: PeerInfo {
             name: "mcpshield".to_string(),
@@ -483,7 +501,7 @@ async fn handle_initialize_with_agent(
         .header("content-type", "application/json")
         .header("mcp-session-id", session_id)
         .body(axum::body::Body::from(body))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: String) -> Response {
@@ -506,29 +524,30 @@ async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         }
     };
     let integration_id = IntegrationId(Uuid::nil());
+    let tool_names: Vec<String> = raw_tools.iter().map(|t| t.name.clone()).collect();
 
-    let mut namespaced = Vec::new();
-    for mut t in raw_tools {
-        let local_name = t.name.clone();
-        // Check policy for this tool
-        let decision = state
-            .policy
-            .evaluate_boxed(
-                &parsed_agent_id,
-                &integration_id,
-                &local_name,
-                &serde_json::Value::Null,
-            )
-            .await;
-        let allowed = match decision {
-            Ok(d) => d.allowed,
-            Err(_) => false,
-        };
-        if allowed {
-            t.name = format!("{slug}__{}", local_name);
-            namespaced.push(t);
+    // Batch policy check — PolicyEngine implementations backed by a DB do this in a single query.
+    let allowed_names: HashSet<String> = match state
+        .policy
+        .list_allowed_boxed(&parsed_agent_id, &integration_id, &tool_names)
+        .await
+    {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!(err = %e, "tools/list: policy evaluation error");
+            return error_json(error_response(Some(req_id), ERR_INTERNAL, "internal error"));
         }
-    }
+    };
+
+    let namespaced: Vec<_> = raw_tools
+        .iter()
+        .filter(|t| allowed_names.contains(&t.name))
+        .map(|t| {
+            let mut t = t.clone();
+            t.name = format!("{slug}__{}", t.name);
+            t
+        })
+        .collect();
 
     let result = ToolsListResult {
         tools: namespaced,
@@ -557,6 +576,8 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         Ok(id) => id,
         Err(resp) => return resp,
     };
+
+    let _call_start = std::time::Instant::now(); // captured for future audit logging
 
     let params: mcpshield_core::mcp::ToolCallParams =
         match req.params.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok()) {
@@ -600,7 +621,6 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         ));
     }
 
-    // Policy check
     let parsed_agent_id = match Uuid::parse_str(&agent_id) {
         Ok(u) => AgentId(u),
         Err(_) => {
@@ -674,7 +694,7 @@ fn json_response(resp: JsonRpcResponse) -> Response {
         .body(axum::body::Body::from(
             serde_json::to_string(&resp).expect("JsonRpcResponse is always serialisable"),
         ))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 pub fn error_json(err: JsonRpcError) -> Response {
@@ -684,12 +704,12 @@ pub fn error_json(err: JsonRpcError) -> Response {
         .body(axum::body::Body::from(
             serde_json::to_string(&err).expect("JsonRpcError is always serialisable"),
         ))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 fn notification_ack() -> Response {
     axum::http::Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(axum::body::Body::empty())
-        .unwrap()
+        .expect("valid response headers")
 }

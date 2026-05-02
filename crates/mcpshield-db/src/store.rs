@@ -30,6 +30,9 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<ClientAuthorizeInfo>, StoreError>;
     async fn get_client_name(&self, client_id: &str) -> Result<Option<String>, StoreError>;
     async fn list_oauth_clients(&self) -> Result<Vec<OAuthClient>, StoreError>;
+    /// Delete an OAuth client by agent_id, removing its auth codes and access tokens first.
+    /// Returns true if the client existed and was deleted, false if not found.
+    async fn delete_oauth_client(&self, agent_id: &str) -> Result<bool, StoreError>;
 
     // --- Auth codes ---
     async fn insert_auth_code(&self, code: &AuthCode) -> Result<(), StoreError>;
@@ -39,8 +42,9 @@ pub trait Store: Send + Sync {
         client_id: &str,
         now: i64,
     ) -> Result<Option<AuthCode>, StoreError>;
-    /// Atomically marks the code used. Returns true if exactly one row was updated.
-    async fn mark_auth_code_used(&self, code: &str) -> Result<bool, StoreError>;
+    /// Atomically marks the code used; also checks expiry to close the cleanup-job TOCTOU.
+    /// Returns true if exactly one row was updated.
+    async fn mark_auth_code_used(&self, code: &str, now: i64) -> Result<bool, StoreError>;
     async fn delete_expired_auth_codes(&self, now: i64) -> Result<u64, StoreError>;
 
     // --- Access tokens ---
@@ -54,11 +58,12 @@ pub trait Store: Send + Sync {
 
     // --- Policy rules ---
     async fn upsert_policy_rule(&self, rule: &PolicyRule) -> Result<(), StoreError>;
+    /// Delete a policy rule. Returns true if deleted, false if it did not exist.
     async fn delete_policy_rule(
         &self,
         agent_id: &str,
         tool_name: &str,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
     async fn list_policy_rules(&self, agent_id: &str) -> Result<Vec<PolicyRule>, StoreError>;
     async fn get_policy_rule(
         &self,

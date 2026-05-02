@@ -1,9 +1,12 @@
 // Admin API — authenticated with Authorization: Basic admin:{password}
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Argon2 long-input DoS cap — no legitimate credential exceeds 1 KiB
 const MAX_PASSWORD_BYTES: usize = 1024;
+/// Reasonable cap to prevent oversized admin path parameters
+const MAX_TOOL_NAME_BYTES: usize = 256;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::extract::{Path, State};
@@ -12,14 +15,19 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use mcpshield_db::PolicyRule;
 
 use crate::crypto::unix_timestamp_secs;
-use crate::handler::{extract_client_ip, AppState};
+use crate::handler::{extract_client_ip, AppState, PeerIp};
 
 /// Verify admin Basic auth. Returns Ok(()) or an error Response.
-pub async fn require_admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), Response> {
+pub async fn require_admin(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+) -> Result<(), Response> {
     let (username, password) = match extract_basic(headers) {
         Some(pair) => pair,
         None => {
@@ -42,10 +50,12 @@ pub async fn require_admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result
             .into_response());
     }
 
-    // Rate-limit failed attempts
-    let ip = extract_client_ip(headers);
+    let ip = extract_client_ip(peer_ip);
     let now = unix_timestamp_secs();
-    if !state.rate_limiter.allow(&ip, now) {
+
+    // Rate-limit on the admin-specific limiter — separate from the OAuth limiter so
+    // a successful OAuth flow cannot reset the admin failure counter.
+    if !state.admin_rate_limiter.allow(&ip, now) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", "60")],
@@ -67,24 +77,27 @@ pub async fn require_admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result
         }
     };
 
-    // Hash both usernames to a fixed length so the comparison is constant-time
-    // regardless of whether the lengths differ.
     use sha2::{Digest, Sha256};
     let username_ok = constant_time_eq::constant_time_eq(
         Sha256::digest(username.as_bytes()).as_slice(),
         Sha256::digest(stored_username.as_bytes()).as_slice(),
     );
 
-    let parsed_hash = PasswordHash::new(&stored_hash).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, "hash parse error").into_response()
-    })?;
+    // Record failure before the hash parse so a corrupted hash doesn't silently skip counting.
+    let parsed_hash = match PasswordHash::new(&stored_hash) {
+        Ok(h) => h,
+        Err(_) => {
+            state.admin_rate_limiter.record_failure(&ip, now);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "setup error").into_response());
+        }
+    };
 
     let password_ok = Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok();
 
     if !username_ok || !password_ok {
-        state.rate_limiter.record_failure(&ip, now);
+        state.admin_rate_limiter.record_failure(&ip, now);
         return Err((
             StatusCode::UNAUTHORIZED,
             [("WWW-Authenticate", "Basic realm=\"MCPShield Admin\"")],
@@ -93,7 +106,7 @@ pub async fn require_admin(state: &Arc<AppState>, headers: &HeaderMap) -> Result
             .into_response());
     }
 
-    state.rate_limiter.record_success(&ip);
+    state.admin_rate_limiter.record_success(&ip);
     Ok(())
 }
 
@@ -110,8 +123,9 @@ fn extract_basic(headers: &HeaderMap) -> Option<(String, String)> {
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
 ) -> Response {
-    if let Err(e) = require_admin(&state, &headers).await {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
         return e;
     }
 
@@ -139,14 +153,44 @@ pub async fn list_agents(
     Json(agents).into_response()
 }
 
+// DELETE /admin/agents/{agent_id}
+pub async fn delete_agent(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+
+    match state.db.delete_oauth_client(&agent_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting agent");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
 // GET /admin/agents/{agent_id}/policy
 pub async fn get_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
     Path(agent_id): Path<String>,
 ) -> Response {
-    if let Err(e) = require_admin(&state, &headers).await {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
         return e;
+    }
+
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
     }
 
     let rules = match state.db.list_policy_rules(&agent_id).await {
@@ -181,11 +225,20 @@ pub struct PolicyRuleRequest {
 pub async fn set_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
     Path(agent_id): Path<String>,
     Json(body): Json<PolicyRuleRequest>,
 ) -> Response {
-    if let Err(e) = require_admin(&state, &headers).await {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
         return e;
+    }
+
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+
+    if body.tool_name.is_empty() || body.tool_name.len() > MAX_TOOL_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
     }
 
     let now = unix_timestamp_secs();
@@ -211,14 +264,24 @@ pub async fn set_policy(
 pub async fn delete_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
     Path((agent_id, tool_name)): Path<(String, String)>,
 ) -> Response {
-    if let Err(e) = require_admin(&state, &headers).await {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
         return e;
     }
 
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+
+    if tool_name.is_empty() || tool_name.len() > MAX_TOOL_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
+    }
+
     match state.db.delete_policy_rule(&agent_id, &tool_name).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(err = %e, "admin: db error deleting policy");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()

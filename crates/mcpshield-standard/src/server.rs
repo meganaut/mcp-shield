@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,7 +7,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use tokio::net::TcpListener;
 
-use crate::admin::{delete_policy, get_policy, list_agents, set_policy};
+use crate::admin::{delete_agent, delete_policy, get_policy, list_agents, set_policy};
 use crate::config::Config;
 use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
@@ -43,12 +44,10 @@ pub async fn run(config: Config) -> Result<()> {
     if !db.is_setup_complete().await.context("check setup")? {
         tracing::info!("Setup not complete — serving setup wizard on http://{addr}/setup");
 
-        // Build a minimal state for the setup wizard
-        // We still need a full AppState but with a stub downstream
-        let downstream = Arc::new(DownstreamClient::new(
-            "http://localhost:1".to_string(),
-            "setup".to_string(),
-        ));
+        let downstream = Arc::new(
+            DownstreamClient::new("http://localhost:1".to_string(), "setup".to_string())
+                .context("build downstream client")?,
+        );
 
         let state = Arc::new(AppState {
             sessions: new_store(),
@@ -58,6 +57,7 @@ pub async fn run(config: Config) -> Result<()> {
             db: Arc::clone(&db),
             pending_auth: new_pending_store(),
             rate_limiter: new_rate_limiter(),
+            admin_rate_limiter: new_rate_limiter(),
             setup_csrf_token: new_setup_csrf_token(),
         });
 
@@ -71,10 +71,10 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     // Full gateway mode
-    let downstream = Arc::new(DownstreamClient::new(
-        config.downstream.url.clone(),
-        config.downstream.slug.clone(),
-    ));
+    let downstream = Arc::new(
+        DownstreamClient::new(config.downstream.url.clone(), config.downstream.slug.clone())
+            .context("build downstream client")?,
+    );
 
     downstream
         .initialize()
@@ -89,6 +89,7 @@ pub async fn run(config: Config) -> Result<()> {
         db: Arc::clone(&db),
         pending_auth: new_pending_store(),
         rate_limiter: new_rate_limiter(),
+        admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
     });
 
@@ -108,15 +109,13 @@ pub async fn run(config: Config) -> Result<()> {
     });
 
     let app = Router::new()
-        // MCP proxy (authenticated)
         .route("/mcp", post(mcp_handler_authenticated))
-        // OAuth endpoints
         .route("/.well-known/oauth-authorization-server", get(get_metadata))
         .route("/oauth/register", post(post_register))
         .route("/oauth/authorize", get(get_authorize).post(post_authorize))
         .route("/oauth/token", post(post_token))
-        // Admin endpoints
         .route("/admin/agents", get(list_agents))
+        .route("/admin/agents/{agent_id}", delete(delete_agent))
         .route("/admin/agents/{agent_id}/policy", get(get_policy).post(set_policy))
         .route("/admin/agents/{agent_id}/policy/{tool_name}", delete(delete_policy))
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -140,15 +139,21 @@ async fn run_plain(app: Router, addr: &str) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .context("bind listener")?;
-    axum::serve(listener, app).await.context("server error")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server error")
 }
 
 #[cfg(feature = "tls")]
 async fn run_tls(app: Router, addr: &str, config: &Config) -> Result<()> {
-    use tokio_rustls::rustls::ServerConfig;
-    use tokio_rustls::TlsAcceptor;
+    use axum::extract::ConnectInfo;
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::TlsAcceptor;
     use tower::Service;
 
     let tls_material = crate::tls::load_or_generate(&config.server.data_dir)
@@ -168,7 +173,7 @@ async fn run_tls(app: Router, addr: &str, config: &Config) -> Result<()> {
     tracing::info!("listening on https://{addr}");
 
     loop {
-        let (stream, _peer_addr) = listener.accept().await.context("accept connection")?;
+        let (stream, peer_addr) = listener.accept().await.context("accept connection")?;
         let acceptor = acceptor.clone();
         let app = app.clone();
 
@@ -180,7 +185,9 @@ async fn run_tls(app: Router, addr: &str, config: &Config) -> Result<()> {
             let _ = http1::Builder::new()
                 .serve_connection(
                     io,
-                    hyper::service::service_fn(move |req| {
+                    hyper::service::service_fn(move |mut req| {
+                        // Inject the real peer address so PeerIp can extract it
+                        req.extensions_mut().insert(ConnectInfo(peer_addr));
                         let mut svc = app.clone();
                         async move { svc.call(req).await }
                     }),

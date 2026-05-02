@@ -38,6 +38,15 @@ fn store_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Internal(e.to_string())
 }
 
+fn store_err_db(e: sqlx::Error) -> StoreError {
+    if let sqlx::Error::Database(ref db_err) = e {
+        if db_err.is_unique_violation() {
+            return StoreError::Conflict(db_err.message().to_string());
+        }
+    }
+    StoreError::Internal(e.to_string())
+}
+
 #[async_trait]
 impl Store for SqliteStore {
     async fn run_migrations(&self) -> Result<(), StoreError> {
@@ -107,7 +116,7 @@ impl Store for SqliteStore {
         .bind(client.created_at)
         .execute(&self.pool)
         .await
-        .map_err(store_err)?;
+        .map_err(store_err_db)?;
         Ok(())
     }
 
@@ -187,6 +196,48 @@ impl Store for SqliteStore {
             .collect()
     }
 
+    async fn delete_oauth_client(&self, agent_id: &str) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+
+        // Find client_id for this agent_id
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT client_id FROM oauth_clients WHERE agent_id = ?")
+                .bind(agent_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(store_err)?;
+
+        let client_id = match row {
+            Some((id,)) => id,
+            None => return Ok(false),
+        };
+
+        // Delete all dependent records (no ON DELETE CASCADE in current schema)
+        sqlx::query("DELETE FROM access_tokens WHERE client_id = ?")
+            .bind(&client_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        sqlx::query("DELETE FROM auth_codes WHERE client_id = ?")
+            .bind(&client_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        sqlx::query("DELETE FROM policy_rules WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        sqlx::query("DELETE FROM oauth_clients WHERE client_id = ?")
+            .bind(&client_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+
+        tx.commit().await.map_err(store_err)?;
+        Ok(true)
+    }
+
     async fn insert_auth_code(&self, code: &AuthCode) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO auth_codes \
@@ -201,7 +252,7 @@ impl Store for SqliteStore {
         .bind(code.expires_at)
         .execute(&self.pool)
         .await
-        .map_err(store_err)?;
+        .map_err(store_err_db)?;
         Ok(())
     }
 
@@ -235,11 +286,13 @@ impl Store for SqliteStore {
         }))
     }
 
-    async fn mark_auth_code_used(&self, code: &str) -> Result<bool, StoreError> {
+    async fn mark_auth_code_used(&self, code: &str, now: i64) -> Result<bool, StoreError> {
+        // Also re-validates expiry atomically so the cleanup job can't race with token exchange.
         let result = sqlx::query(
-            "UPDATE auth_codes SET used = 1 WHERE code = ? AND used = 0",
+            "UPDATE auth_codes SET used = 1 WHERE code = ? AND used = 0 AND expires_at > ?",
         )
         .bind(code)
+        .bind(now)
         .execute(&self.pool)
         .await
         .map_err(store_err)?;
@@ -319,8 +372,8 @@ impl Store for SqliteStore {
         &self,
         agent_id: &str,
         tool_name: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             "DELETE FROM policy_rules WHERE agent_id = ? AND tool_name = ?",
         )
         .bind(agent_id)
@@ -328,7 +381,7 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(store_err)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_policy_rules(&self, agent_id: &str) -> Result<Vec<PolicyRule>, StoreError> {

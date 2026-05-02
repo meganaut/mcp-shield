@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use mcpshield_core::mcp::{
     InitializeResult, JsonRpcOutcome, JsonRpcRequest, RequestId, Tool,
@@ -16,26 +18,26 @@ pub struct DownstreamClient {
     slug: String,
     next_id: AtomicU64,
     session_id: RwLock<Option<String>>,
-    tools: RwLock<Vec<Tool>>,
+    tools: RwLock<Arc<Vec<Tool>>>,
     capabilities: RwLock<serde_json::Value>,
 }
 
 impl DownstreamClient {
-    pub fn new(url: String, slug: String) -> Self {
+    pub fn new(url: String, slug: String) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("reqwest client build");
-        Self {
+            .context("build reqwest client")?;
+        Ok(Self {
             http,
             url,
             slug,
             next_id: AtomicU64::new(1),
             session_id: RwLock::new(None),
-            tools: RwLock::new(Vec::new()),
+            tools: RwLock::new(Arc::new(Vec::new())),
             capabilities: RwLock::new(serde_json::Value::Object(Default::default())),
-        }
+        })
     }
 
     fn next_id(&self) -> RequestId {
@@ -204,12 +206,12 @@ impl DownstreamClient {
             }
         }
 
-        *self.tools.write().await = all_tools;
+        *self.tools.write().await = Arc::new(all_tools);
         Ok(())
     }
 
-    pub async fn list_tools(&self) -> Vec<Tool> {
-        self.tools.read().await.clone()
+    pub async fn list_tools(&self) -> Arc<Vec<Tool>> {
+        Arc::clone(&*self.tools.read().await)
     }
 
     pub fn slug(&self) -> &str {

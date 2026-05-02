@@ -59,7 +59,7 @@ static SETUP_DONE: &str = r#"<!DOCTYPE html>
 </html>"#;
 
 pub async fn get_setup(State(state): State<Arc<AppState>>) -> Response {
-    html_response(render_form(&state.setup_csrf_token, "", "", ""))
+    html_response(render_form(&state.setup_csrf_token, &[], "", ""))
 }
 
 pub async fn get_setup_done() -> Response {
@@ -68,7 +68,7 @@ pub async fn get_setup_done() -> Response {
         .header("content-type", "text/html; charset=utf-8")
         .header("content-security-policy", CSP)
         .body(axum::body::Body::from(SETUP_DONE))
-        .unwrap()
+        .expect("valid response headers")
 }
 
 #[derive(Deserialize)]
@@ -102,7 +102,7 @@ pub async fn post_setup(
         return (StatusCode::FORBIDDEN, "invalid request").into_response();
     }
 
-    let mut errors = Vec::new();
+    let mut errors: Vec<&str> = Vec::new();
 
     if form.admin_username.trim().is_empty() {
         errors.push("Admin username must not be empty.");
@@ -123,14 +123,9 @@ pub async fn post_setup(
     }
 
     if !errors.is_empty() {
-        let error_html: String = errors
-            .iter()
-            .map(|e| format!(r#"<p class="error">{}</p>"#, html_escape(e)))
-            .collect::<Vec<_>>()
-            .join("\n");
         return html_response(render_form(
             &state.setup_csrf_token,
-            &error_html,
+            &errors,
             &form.admin_username,
             &form.issuer_url,
         ));
@@ -145,7 +140,7 @@ pub async fn post_setup(
             tracing::error!(err = %e, "setup: failed to hash password");
             return html_response(render_form(
                 &state.setup_csrf_token,
-                r#"<p class="error">Setup failed. Check server logs.</p>"#,
+                &["Setup failed. Check server logs."],
                 &form.admin_username,
                 &form.issuer_url,
             ));
@@ -161,7 +156,7 @@ pub async fn post_setup(
         tracing::error!(err = %e, "setup: failed to save setup state");
         return html_response(render_form(
             &state.setup_csrf_token,
-            r#"<p class="error">Setup failed. Check server logs.</p>"#,
+            &["Setup failed. Check server logs."],
             &form.admin_username,
             &form.issuer_url,
         ));
@@ -170,10 +165,15 @@ pub async fn post_setup(
     Redirect::to("/setup/done").into_response()
 }
 
-fn render_form(csrf_token: &str, errors: &str, username: &str, issuer: &str) -> String {
+fn render_form(csrf_token: &str, errors: &[&str], username: &str, issuer: &str) -> String {
+    let error_html: String = errors
+        .iter()
+        .map(|e| format!(r#"<p class="error">{}</p>"#, html_escape(e)))
+        .collect::<Vec<_>>()
+        .join("\n");
     SETUP_FORM
         .replace("{CSRF_TOKEN}", &html_escape(csrf_token))
-        .replace("{ERRORS}", errors)
+        .replace("{ERRORS}", &error_html)
         .replace("{USERNAME}", &html_escape(username))
         .replace("{ISSUER}", &html_escape(issuer))
 }
@@ -186,5 +186,5 @@ fn html_response(body: String) -> Response {
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
         .body(axum::body::Body::from(body))
-        .unwrap()
+        .expect("valid response headers")
 }

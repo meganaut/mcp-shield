@@ -15,9 +15,11 @@ use uuid::Uuid;
 
 use mcpshield_db::OAuthClient;
 
+use mcpshield_db::StoreError;
+
 use crate::admin::require_admin;
 use crate::crypto::{random_base64url, unix_timestamp_secs};
-use crate::handler::AppState;
+use crate::handler::{AppState, PeerIp};
 
 const CLIENT_NAME_MAX_LEN: usize = 256;
 const MAX_REDIRECT_URIS: usize = 10;
@@ -41,10 +43,10 @@ pub struct DcrResponse {
 pub async fn post_register(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
     Json(req): Json<DcrRequest>,
 ) -> Response {
-    // Require admin Basic auth — prevents unauthenticated client self-registration.
-    if let Err(resp) = require_admin(&state, &headers).await {
+    if let Err(resp) = require_admin(&state, &headers, peer_ip).await {
         return resp;
     }
 
@@ -116,6 +118,13 @@ pub async fn post_register(
         })
         .await
     {
+        if matches!(e, StoreError::Conflict(_)) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "client_already_exists"})),
+            )
+                .into_response();
+        }
         tracing::error!(err = %e, "dcr: db error inserting client");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }

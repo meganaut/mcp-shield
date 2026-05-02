@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::routing::post;
@@ -26,7 +27,9 @@ async fn make_test_db() -> Arc<dyn mcpshield_db::Store> {
 }
 
 async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
-    let downstream = Arc::new(DownstreamClient::new(mock_url, slug.to_string()));
+    let downstream = Arc::new(
+        DownstreamClient::new(mock_url, slug.to_string()).expect("build downstream"),
+    );
     downstream.initialize().await.expect("downstream init");
 
     let db = make_test_db().await;
@@ -39,6 +42,7 @@ async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
         db,
         pending_auth: new_pending_store(),
         rate_limiter: new_rate_limiter(),
+        admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
     });
 
@@ -50,7 +54,12 @@ async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     (format!("http://{}", addr), state)

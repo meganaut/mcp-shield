@@ -41,7 +41,7 @@ pub async fn get_metadata(State(state): State<Arc<AppState>>) -> Response {
         .header("content-type", "application/json")
         .header("cache-control", "max-age=3600")
         .body(axum::body::Body::from(
-            serde_json::to_string(&metadata).unwrap(),
+            serde_json::to_string(&metadata).expect("metadata is always serialisable"),
         ))
-        .unwrap()
+        .expect("valid response headers")
 }
