@@ -4,5 +4,6 @@ members = [
     "crates/mcpshield-db",
     "crates/mcpshield-policy-sql",
     "crates/mcpshield-standard",
+    "crates/mcpshield-test-support",
 ]
 resolver = "2"

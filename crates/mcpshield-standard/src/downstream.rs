@@ -1,0 +1,261 @@
+use anyhow::{Context, Result};
+use mcpshield_core::mcp::{
+    InitializeResult, JsonRpcOutcome, JsonRpcRequest, RequestId, Tool,
+    ToolCallParams, ToolsListParams, ToolsListResult, SUPPORTED_PROTOCOL_VERSION,
+};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::RwLock;
+
+const MAX_PAGINATION_PAGES: usize = 100;
+const MAX_TOTAL_TOOLS: usize = 10_000;
+
+pub struct DownstreamClient {
+    http: reqwest::Client,
+    url: String,
+    slug: String,
+    next_id: AtomicU64,
+    session_id: RwLock<Option<String>>,
+    tools: RwLock<Vec<Tool>>,
+    capabilities: RwLock<serde_json::Value>,
+}
+
+impl DownstreamClient {
+    pub fn new(url: String, slug: String) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("reqwest client build");
+        Self {
+            http,
+            url,
+            slug,
+            next_id: AtomicU64::new(1),
+            session_id: RwLock::new(None),
+            tools: RwLock::new(Vec::new()),
+            capabilities: RwLock::new(serde_json::Value::Object(Default::default())),
+        }
+    }
+
+    fn next_id(&self) -> RequestId {
+        RequestId::Number(self.next_id.fetch_add(1, Ordering::AcqRel) as i64)
+    }
+
+    pub async fn initialize(&self) -> Result<()> {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(self.next_id()),
+            method: "initialize".to_string(),
+            params: Some(json!({
+                "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "mcpshield", "version": "0.1.0" }
+            })),
+        };
+
+        let response = self
+            .http
+            .post(format!("{}/mcp", self.url))
+            .json(&req)
+            .send()
+            .await
+            .context("downstream initialize request failed")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("downstream initialize returned HTTP {}", response.status());
+        }
+
+        // Validate the session ID before storing — reject any value with non-printable
+        // ASCII or CRLF characters that could cause header injection downstream.
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| (0x20..0x7f).contains(&b)))
+            .map(|s| s.to_string());
+
+        let outcome: JsonRpcOutcome = response
+            .json()
+            .await
+            .context("downstream initialize response parse failed")?;
+
+        let init_result = match outcome {
+            JsonRpcOutcome::Error(err) => anyhow::bail!(
+                "downstream initialize failed: {} (code {})",
+                err.error.message,
+                err.error.code
+            ),
+            JsonRpcOutcome::Success(resp) => serde_json::from_value::<InitializeResult>(resp.result)
+                .context("downstream initialize result parse failed")?,
+        };
+
+        *self.capabilities.write().await = init_result.capabilities;
+        *self.session_id.write().await = session_id;
+
+        self.send_initialized().await?;
+        self.refresh_tools().await?;
+        Ok(())
+    }
+
+    async fn send_initialized(&self) -> Result<()> {
+        let notification = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+
+        let mut builder = self
+            .http
+            .post(format!("{}/mcp", self.url))
+            .json(&notification);
+
+        if let Some(sid) = self.session_id.read().await.as_ref() {
+            builder = builder.header("mcp-session-id", sid.clone());
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .context("downstream notifications/initialized failed")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "downstream notifications/initialized returned HTTP {}",
+                resp.status()
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_tools(&self) -> Result<()> {
+        let mut all_tools: Vec<Tool> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            if pages >= MAX_PAGINATION_PAGES {
+                anyhow::bail!(
+                    "downstream tools/list exceeded {} pagination pages",
+                    MAX_PAGINATION_PAGES
+                );
+            }
+            pages += 1;
+
+            let params = ToolsListParams {
+                cursor: cursor.clone(),
+            };
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(self.next_id()),
+                method: "tools/list".to_string(),
+                params: Some(serde_json::to_value(&params)?),
+            };
+
+            let mut builder = self
+                .http
+                .post(format!("{}/mcp", self.url))
+                .json(&req);
+
+            if let Some(sid) = self.session_id.read().await.as_ref() {
+                builder = builder.header("mcp-session-id", sid.clone());
+            }
+
+            let resp = builder
+                .send()
+                .await
+                .context("downstream tools/list request failed")?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!("downstream tools/list returned HTTP {}", resp.status());
+            }
+
+            let outcome: JsonRpcOutcome = resp
+                .json()
+                .await
+                .context("downstream tools/list response parse failed")?;
+
+            let json_resp = match outcome {
+                JsonRpcOutcome::Success(r) => r,
+                JsonRpcOutcome::Error(e) => anyhow::bail!(
+                    "downstream tools/list failed: {} (code {})",
+                    e.error.message,
+                    e.error.code
+                ),
+            };
+
+            let list: ToolsListResult = serde_json::from_value(json_resp.result)
+                .context("downstream tools/list result parse failed")?;
+
+            all_tools.extend(list.tools);
+
+            if all_tools.len() > MAX_TOTAL_TOOLS {
+                anyhow::bail!(
+                    "downstream tools/list exceeded {} total tools",
+                    MAX_TOTAL_TOOLS
+                );
+            }
+
+            match list.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+
+        *self.tools.write().await = all_tools;
+        Ok(())
+    }
+
+    pub async fn list_tools(&self) -> Vec<Tool> {
+        self.tools.read().await.clone()
+    }
+
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+
+    pub async fn capabilities(&self) -> serde_json::Value {
+        self.capabilities.read().await.clone()
+    }
+
+    pub async fn downstream_session_id(&self) -> Option<String> {
+        self.session_id.read().await.clone()
+    }
+
+    pub async fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<JsonRpcOutcome> {
+        let params = ToolCallParams {
+            name: name.to_string(),
+            arguments,
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(self.next_id()),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::to_value(&params)?),
+        };
+
+        let mut builder = self
+            .http
+            .post(format!("{}/mcp", self.url))
+            .json(&req);
+
+        if let Some(sid) = self.session_id.read().await.as_ref() {
+            builder = builder.header("mcp-session-id", sid.clone());
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .context("downstream tools/call request failed")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("downstream tools/call returned HTTP {}", resp.status());
+        }
+
+        resp.json::<JsonRpcOutcome>()
+            .await
+            .context("downstream tools/call response parse failed")
+    }
+}

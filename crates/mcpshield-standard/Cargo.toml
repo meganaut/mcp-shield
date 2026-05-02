@@ -3,10 +3,12 @@ name = "mcpshield-standard"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["tls"]
+tls = ["tokio-rustls", "rustls-pemfile"]
+
 [dependencies]
 mcpshield-core = { path = "../mcpshield-core" }
-mcpshield-db = { path = "../mcpshield-db", features = ["sqlite"] }
-mcpshield-policy-sql = { path = "../mcpshield-policy-sql", features = ["sqlite"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +20,23 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
-argon2 = "0.5"
-ring = "0.17"
 rcgen = "0.13"
-instant-acme = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dashmap = "6"
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+tower = "0.5"
+
+[dev-dependencies]
+mcpshield-test-support = { path = "../mcpshield-test-support" }
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "mcpshield"
+path = "src/main.rs"
+
+[lib]
+name = "mcpshield_standard"
+path = "src/lib.rs"

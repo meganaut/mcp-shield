@@ -1,0 +1,310 @@
+use std::sync::Arc;
+
+use axum::routing::post;
+use axum::Router;
+use mcpshield_core::mcp::{
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, Tool, SUPPORTED_PROTOCOL_VERSION,
+};
+use mcpshield_standard::handler::{mcp_handler, AppState};
+use mcpshield_standard::noop::{NoopAudit, NoopPolicy};
+use mcpshield_standard::session::new_store;
+use mcpshield_standard::downstream::DownstreamClient;
+use mcpshield_test_support::MockMcpServer;
+use serde_json::json;
+use tokio::net::TcpListener;
+
+async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
+    let downstream = Arc::new(DownstreamClient::new(mock_url, slug.to_string()));
+    downstream.initialize().await.expect("downstream init");
+
+    let state = Arc::new(AppState {
+        sessions: new_store(),
+        downstream,
+        policy: Arc::new(NoopPolicy),
+        audit: Arc::new(NoopAudit),
+    });
+
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .with_state(Arc::clone(&state));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    (format!("http://{}", addr), state)
+}
+
+async fn send_request(url: &str, req: &JsonRpcRequest) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{url}/mcp"))
+        .json(req)
+        .send()
+        .await
+        .expect("send request")
+}
+
+async fn send_request_with_session(
+    url: &str,
+    req: &JsonRpcRequest,
+    session_id: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{url}/mcp"))
+        .header("mcp-session-id", session_id)
+        .json(req)
+        .send()
+        .await
+        .expect("send request with session")
+}
+
+async fn do_initialize(url: &str) -> (JsonRpcResponse, String) {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(1)),
+        method: "initialize".to_string(),
+        params: Some(json!({
+            "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "0.0.1" }
+        })),
+    };
+    let resp = send_request(url, &req).await;
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body: JsonRpcResponse = resp.json().await.expect("parse initialize response");
+    (body, session_id)
+}
+
+#[tokio::test]
+async fn test_initialize_accepted() {
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (resp, session_id) = do_initialize(&proxy_url).await;
+
+    assert!(!session_id.is_empty(), "Mcp-Session-Id header must be set");
+    let version = resp.result["protocolVersion"].as_str().unwrap();
+    assert_eq!(version, SUPPORTED_PROTOCOL_VERSION);
+}
+
+#[tokio::test]
+async fn test_initialize_version_negotiated() {
+    // When client sends an unsupported version, the server responds with its own
+    // supported version rather than hard-rejecting. The client can then decide
+    // whether to proceed.
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(1)),
+        method: "initialize".to_string(),
+        params: Some(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "0.0.1" }
+        })),
+    };
+
+    let resp = send_request(&proxy_url, &req).await;
+    let body: JsonRpcResponse = resp.json().await.expect("parse initialize response");
+    assert_eq!(
+        body.result["protocolVersion"].as_str().unwrap(),
+        SUPPORTED_PROTOCOL_VERSION,
+        "server must respond with its own supported version"
+    );
+}
+
+#[tokio::test]
+async fn test_tools_list_namespaced() {
+    let tools = vec![
+        Tool {
+            name: "read_file".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        },
+        Tool {
+            name: "write_file".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+        },
+    ];
+    let mock = MockMcpServer::start(tools).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+    assert!(!session_id.is_empty());
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(2)),
+        method: "tools/list".to_string(),
+        params: None,
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    let body: JsonRpcResponse = resp.json().await.expect("parse tools/list response");
+
+    let tools_arr = body.result["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools_arr
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+
+    assert!(names.contains(&"fs__read_file"), "expected fs__read_file, got {names:?}");
+    assert!(names.contains(&"fs__write_file"), "expected fs__write_file, got {names:?}");
+}
+
+#[tokio::test]
+async fn test_tools_call_routed() {
+    let tools = vec![Tool {
+        name: "read_file".to_string(),
+        description: None,
+        input_schema: json!({"type": "object"}),
+    }];
+    let mock = MockMcpServer::start(tools).await;
+    let mock_url = mock.url();
+    let (proxy_url, _state) = start_proxy(mock_url, "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+
+    let args = json!({"path": "/etc/hosts"});
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(3)),
+        method: "tools/call".to_string(),
+        params: Some(json!({
+            "name": "fs__read_file",
+            "arguments": args
+        })),
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    let body: JsonRpcResponse = resp.json().await.expect("parse tools/call response");
+    let content = body.result["content"].as_array().expect("content array");
+    assert!(!content.is_empty());
+
+    let calls = mock.calls().await;
+    assert_eq!(calls.len(), 1, "mock should have received one call");
+    assert_eq!(calls[0].tool_name, "read_file");
+    assert_eq!(calls[0].arguments, Some(args));
+    assert_eq!(
+        calls[0].session_id.as_deref(),
+        Some(mock.session_id()),
+        "proxy must forward downstream session ID on tool calls"
+    );
+}
+
+#[tokio::test]
+async fn test_tools_call_unknown_slug() {
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(4)),
+        method: "tools/call".to_string(),
+        params: Some(json!({
+            "name": "unknown__something",
+            "arguments": null
+        })),
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    let body: JsonRpcError = resp.json().await.expect("parse error response");
+
+    assert_eq!(body.error.code, -32601, "expected method-not-found error code");
+}
+
+#[tokio::test]
+async fn test_tools_call_known_slug_unknown_tool() {
+    // Correct slug, but the local tool name doesn't exist on the downstream.
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(4)),
+        method: "tools/call".to_string(),
+        params: Some(json!({
+            "name": "fs__nonexistent",
+            "arguments": null
+        })),
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    let body: JsonRpcError = resp.json().await.expect("parse error response");
+
+    assert_eq!(body.error.code, -32601, "expected method-not-found for unknown local tool");
+}
+
+#[tokio::test]
+async fn test_tools_call_no_namespace_separator() {
+    // Tool name with no __ separator at all should be rejected.
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(RequestId::Number(4)),
+        method: "tools/call".to_string(),
+        params: Some(json!({
+            "name": "read_file",
+            "arguments": null
+        })),
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    let body: JsonRpcError = resp.json().await.expect("parse error response");
+
+    assert_eq!(body.error.code, -32601, "expected method-not-found for non-namespaced tool");
+}
+
+#[tokio::test]
+async fn test_notifications_initialized_valid_session() {
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let (_init_resp, session_id) = do_initialize(&proxy_url).await;
+    assert!(!session_id.is_empty());
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: None,
+        method: "notifications/initialized".to_string(),
+        params: None,
+    };
+
+    let resp = send_request_with_session(&proxy_url, &req, &session_id).await;
+    assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn test_notifications_initialized_without_session_accepted_silently() {
+    let mock = MockMcpServer::start(vec![]).await;
+    let (proxy_url, _state) = start_proxy(mock.url(), "fs").await;
+
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: None,
+        method: "notifications/initialized".to_string(),
+        params: None,
+    };
+
+    let resp = send_request(&proxy_url, &req).await;
+    assert_eq!(resp.status(), 204, "notifications must always get 204, never a meaningful error");
+}
