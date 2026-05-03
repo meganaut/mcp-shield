@@ -26,6 +26,7 @@ anyhow = "1"
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dashmap = "6"
+rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 hyper = { version = "1", features = ["full"] }

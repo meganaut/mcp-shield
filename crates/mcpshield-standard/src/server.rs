@@ -26,6 +26,10 @@ use mcpshield_db_sqlite::SqliteStore;
 use mcpshield_policy_db::DbPolicyEngine;
 
 pub async fn run(config: Config) -> Result<()> {
+    tokio::fs::create_dir_all(&config.server.data_dir)
+        .await
+        .context("create data directory")?;
+
     let db_path = config
         .server
         .data_dir
@@ -76,10 +80,9 @@ pub async fn run(config: Config) -> Result<()> {
             .context("build downstream client")?,
     );
 
-    downstream
-        .initialize()
-        .await
-        .context("failed to initialize downstream connection")?;
+    if let Err(e) = downstream.initialize().await {
+        tracing::warn!(err = %e, "downstream not reachable at startup — gateway will serve empty tool list until downstream is available");
+    }
 
     let state = Arc::new(AppState {
         sessions: new_store(),

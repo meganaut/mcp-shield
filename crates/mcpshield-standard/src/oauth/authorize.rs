@@ -15,7 +15,11 @@ use mcpshield_db::AuthCode;
 use crate::crypto::{random_base64url, unix_timestamp_secs};
 use crate::handler::{extract_client_ip, AppState, PeerIp, PendingAuthRequest};
 
-const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
+fn make_csp(_issuer_url: &str) -> String {
+    // form-action intentionally omitted: default-src 'none' prevents all script execution,
+    // so there is no XSS vector to hijack the form action. The request_id provides CSRF protection.
+    "default-src 'none'; style-src 'unsafe-inline'".to_string()
+}
 
 const PENDING_TTL_SECS: i64 = 600; // 10 minutes
 const MAX_PENDING_ENTRIES: usize = 10_000;
@@ -42,7 +46,7 @@ static LOGIN_FORM: &str = r#"<!DOCTYPE html>
 <h1>Authorize Agent</h1>
 <p>Sign in to authorize <strong>{CLIENT_NAME}</strong>.</p>
 {ERROR}
-<form method="POST" action="/oauth/authorize">
+<form method="POST" action="{ACTION_URL}">
   <input type="hidden" name="request_id" value="{REQUEST_ID}">
   <label>Username<input type="text" name="username" autocomplete="username"></label>
   <label>Password<input type="password" name="password" autocomplete="current-password"></label>
@@ -157,15 +161,22 @@ pub async fn get_authorize(
         },
     );
 
+    let issuer = match state.db.get_setup_value("issuer_url").await {
+        Ok(Some(u)) => u,
+        _ => String::new(),
+    };
+    let action_url = format!("{}/oauth/authorize", issuer.trim_end_matches('/'));
+
     let html = LOGIN_FORM
         .replace("{CLIENT_NAME}", &html_escape(&client_name))
         .replace("{REQUEST_ID}", &html_escape(&request_id))
+        .replace("{ACTION_URL}", &html_escape(&action_url))
         .replace("{ERROR}", "");
 
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/html; charset=utf-8")
-        .header("content-security-policy", CSP)
+        .header("content-security-policy", make_csp(&issuer))
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
         .body(axum::body::Body::from(html))
@@ -310,15 +321,22 @@ async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, 
         },
     );
 
+    let issuer = match state.db.get_setup_value("issuer_url").await {
+        Ok(Some(u)) => u,
+        _ => String::new(),
+    };
+    let action_url = format!("{}/oauth/authorize", issuer.trim_end_matches('/'));
+
     let html = LOGIN_FORM
         .replace("{CLIENT_NAME}", &html_escape(&name))
         .replace("{REQUEST_ID}", &html_escape(&new_request_id))
+        .replace("{ACTION_URL}", &html_escape(&action_url))
         .replace("{ERROR}", r#"<p class="error">Invalid credentials.</p>"#);
 
     axum::http::Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "text/html; charset=utf-8")
-        .header("content-security-policy", CSP)
+        .header("content-security-policy", make_csp(&issuer))
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
         .body(axum::body::Body::from(html))

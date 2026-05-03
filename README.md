@@ -95,12 +95,16 @@ mcpshield-db-pg  (future)
 
 mcpshield-policy-db
   DbPolicyEngine: impl PolicyEngine
-  Calls store.get_policy_rule() — no SQL, no DB dep
-  Depends only on mcpshield-core + mcpshield-db (traits)
+  Per-call evaluation: calls store.get_policy_rule()
+  tools/list batch evaluation: overrides list_allowed_boxed() with a single
+    store.list_policy_rules() call — O(1) queries regardless of tool count
+  Depends only on mcpshield-core + mcpshield-db (traits); no SQL, no DB dep
 
 mcpshield-standard
-  Axum handlers, OAuth2/PKCE server, MCP proxy
+  Axum handlers, OAuth2/PKCE server, MCP proxy, admin API
   Holds Arc<dyn Store> + Arc<dyn PolicyEngine> in AppState
+  Separate rate limiters for OAuth and admin endpoints
+  Peer IP from ConnectInfo<SocketAddr> — X-Forwarded-For headers not trusted
   No sqlx, no knowledge of SQLite or PostgreSQL
   server.rs is the composition root: the only place that
   imports mcpshield-db-sqlite and mcpshield-policy-db
@@ -111,9 +115,22 @@ mcpshield-test-support
 
 This means adding a PostgreSQL backend, an OPA-based policy engine, or a DynamoDB audit sink is a matter of adding a new crate — no changes to `mcpshield-standard` or `mcpshield-core`.
 
+## Security properties
+
+- **Deny by default** — a tool call is denied unless an explicit allow rule exists for the (agent, tool) pair
+- **Peer IP from kernel** — rate limiting uses `ConnectInfo<SocketAddr>` (TCP peer address); X-Forwarded-For headers are not trusted
+- **Separate rate limiters** — OAuth and admin endpoint failures are tracked independently; a successful OAuth flow cannot reset the admin brute-force counter
+- **Atomic auth code expiry** — `mark_auth_code_used` revalidates expiry inside the UPDATE predicate, closing the TOCTOU window with the cleanup job
+- **PKCE code challenge** — byte-level comparison; rejects embedded nulls and Unicode-normalisation attacks
+- **TLS private key** — written with mode `0o600`; world-readable key files are refused at startup
+- **Argon2id** — admin password and client secrets hashed with Argon2id; inputs capped at 1 KiB
+- **Agent isolation** — deleting an agent removes its OAuth client, all access tokens, auth codes, and policy rules in a single transaction
+
 ## Status
 
-Early development. Not ready for use.
+The core gateway, OAuth2/PKCE server, policy engine, and admin API are implemented and security-hardened. Credential vault, DLP pipeline, audit logging, and Web UI are not yet built.
+
+Not ready for use.
 
 ## Licence
 

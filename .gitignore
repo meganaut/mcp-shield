@@ -1,3 +1,12 @@
 tmp/
 target/
 .claude/
+.mcp.json
+data/
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.crt
+.playwright-mcp/
