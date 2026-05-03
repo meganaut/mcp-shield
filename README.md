@@ -18,12 +18,13 @@ MCP-compatible agent (any client)
         |  MCP protocol
         |
   [MCPShield Gateway]
-        |-- Policy Engine      deny by default, per-tool permissions
-        |-- DLP Pipeline       scan params + responses, redact sensitive values
-        |-- Audit Logger       every call logged, allowed or denied
-        |-- Credential Vault   OAuth tokens encrypted at rest, never exposed to agent
-        |-- OAuth Server       issues tokens to agents
-        |-- Web UI             management dashboard
+        |-- Policy Engine      ✓ deny by default, per-tool allow rules
+        |-- OAuth Server       ✓ issues tokens to agents (OAuth2/PKCE)
+        |-- Admin API          ✓ manage agents and policies
+        |-- Credential Vault   (planned) downstream OAuth tokens, encrypted at rest
+        |-- DLP Pipeline       (planned) scan params + responses, redact secrets
+        |-- Audit Logger       (planned) every call logged, allowed or denied
+        |-- Web UI             (planned) management dashboard
         |
         |  Outbound HTTPS
         |
@@ -34,17 +35,18 @@ The agent connects to MCPShield as if it were a single MCP server. MCPShield pro
 
 ## Roadmap
 
-### Desktop edition (current focus)
+### Standard edition
 
-A single-user, locally-run edition for developers and homelab users who want governed MCP access for their own agents.
+A single-user, self-hosted edition for developers and homelab users who want governed MCP access for their own agents.
 
 - Register any OAuth-backed MCP server as an integration
-- Configure which tools each agent is permitted to call, with optional parameter constraints
-- Credential vault — OAuth tokens encrypted at rest, never returned to the agent
-- DLP scanning — inbound parameters and outbound responses scanned for secrets and sensitive patterns, detected values redacted automatically
 - Agent profiles — each agent authenticates via OAuth client credentials and has its own permission set
+- Per-tool policy engine — deny by default, explicit allow rules per (agent, tool) pair
+- Credential vault — downstream OAuth tokens encrypted at rest, never returned to the agent
+- DLP scanning — inbound parameters and outbound responses scanned for secrets and sensitive patterns, detected values redacted automatically
 - Meta-tools — agents can discover available integrations, check connection status, and initiate OAuth flows from within a conversation
 - Structured audit logging
+- Web UI — management dashboard for agents, policies, and integrations
 - Single binary, no external dependencies
 
 ### Enterprise edition (future)
