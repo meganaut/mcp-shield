@@ -9,17 +9,18 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 const MAX_TOOL_NAME_BYTES: usize = 256;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use mcpshield_core::vault::VaultTokenData;
+use mcpshield_db::{Integration, PolicyRule};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use mcpshield_db::PolicyRule;
-
 use crate::crypto::unix_timestamp_secs;
+use crate::downstream::DownstreamClient;
 use crate::handler::{extract_client_ip, AppState, PeerIp};
 
 /// Verify admin Basic auth. Returns Ok(()) or an error Response.
@@ -311,4 +312,507 @@ pub async fn delete_policy(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
+}
+
+// ─── Integration Admin Handlers ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateIntegrationRequest {
+    pub slug: String,
+    pub name: String,
+    pub mcp_url: String,
+    pub oauth_auth_url: Option<String>,
+    pub oauth_token_url: Option<String>,
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Option<Vec<String>>,
+}
+
+fn validate_slug(slug: &str) -> Result<(), Response> {
+    if slug.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "slug must not be empty").into_response());
+    }
+    if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err((StatusCode::BAD_REQUEST, "slug must contain only alphanumeric, '-', or '_'").into_response());
+    }
+    if slug.contains("__") {
+        return Err((StatusCode::BAD_REQUEST, "slug must not contain '__'").into_response());
+    }
+    Ok(())
+}
+
+// GET /admin/integrations
+pub async fn list_integrations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    match state.db.list_integrations().await {
+        Ok(integrations) => {
+            let body: Vec<serde_json::Value> = integrations
+                .into_iter()
+                .map(|i| serde_json::json!({
+                    "id": i.id,
+                    "slug": i.slug,
+                    "name": i.name,
+                    "mcp_url": i.mcp_url,
+                    "oauth_auth_url": i.oauth_auth_url,
+                    "oauth_token_url": i.oauth_token_url,
+                    "oauth_client_id": i.oauth_client_id,
+                    "oauth_scopes": i.oauth_scopes,
+                    "connected": i.connected,
+                    "created_at": i.created_at,
+                }))
+                .collect();
+            Json(body).into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error listing integrations");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/integrations
+pub async fn create_integration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Json(body): Json<CreateIntegrationRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    if let Err(e) = validate_slug(&body.slug) {
+        return e;
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let now = unix_timestamp_secs();
+
+    let integration = Integration {
+        id: id.clone(),
+        slug: body.slug.clone(),
+        name: body.name.clone(),
+        mcp_url: body.mcp_url.clone(),
+        oauth_auth_url: body.oauth_auth_url.clone(),
+        oauth_token_url: body.oauth_token_url.clone(),
+        oauth_client_id: body.oauth_client_id.clone(),
+        oauth_scopes: body.oauth_scopes.clone(),
+        connected: false,
+        created_at: now,
+    };
+
+    match state.db.insert_integration(&integration).await {
+        Ok(()) => {}
+        Err(mcpshield_db::StoreError::Conflict(_)) => {
+            return (StatusCode::CONFLICT, "slug already exists").into_response();
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error creating integration");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    }
+
+    // Create downstream client and try to connect (non-fatal)
+    match DownstreamClient::new(body.mcp_url.clone(), body.slug.clone(), id.clone()) {
+        Ok(client) => {
+            let client = Arc::new(client);
+            state.downstreams.insert(body.slug.clone(), Arc::clone(&client));
+            let client_clone = Arc::clone(&client);
+            tokio::spawn(async move {
+                if let Err(e) = client_clone.initialize(None).await {
+                    tracing::warn!(err = %e, "integration: downstream not reachable on create");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "admin: failed to build downstream client on create");
+        }
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": id, "slug": body.slug })),
+    )
+        .into_response()
+}
+
+// DELETE /admin/integrations/{id}
+pub async fn delete_integration_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    // Look up slug before deleting so we can remove from downstreams map
+    let integration = match state.db.get_integration(&id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error looking up integration");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    match state.db.delete_integration(&id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting integration");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    }
+
+    // Remove from in-memory maps
+    state.downstreams.remove(&integration.slug);
+    state.vault_cache.remove(&id);
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// POST /admin/integrations/{id}/refresh
+pub async fn refresh_integration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    let integration = match state.db.get_integration(&id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error looking up integration for refresh");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    let downstream = match state.downstreams.get(&integration.slug) {
+        Some(d) => d.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "downstream not connected").into_response(),
+    };
+
+    // Get vault token if available
+    let auth_token = match state.vault.get_token(&id).await {
+        Ok(Some(data)) => data.access_token,
+        _ => None,
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = downstream.initialize(auth_token.as_deref()).await {
+            tracing::warn!(err = %e, "integration refresh: downstream error");
+        }
+    });
+
+    StatusCode::ACCEPTED.into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClientCredsRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub token_url: Option<String>,
+    pub scopes: Option<Vec<String>>,
+}
+
+// POST /admin/integrations/{id}/connect/client-credentials
+pub async fn connect_client_credentials(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+    Json(body): Json<ClientCredsRequest>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    let integration = match state.db.get_integration(&id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error looking up integration");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    let token_url = body.token_url
+        .as_deref()
+        .or(integration.oauth_token_url.as_deref())
+        .map(|s| s.to_string());
+
+    let token_url = match token_url {
+        Some(u) => u,
+        None => {
+            return (StatusCode::BAD_REQUEST, "token_url required: integration has no oauth_token_url").into_response();
+        }
+    };
+
+    // Build form params for client_credentials grant
+    let mut form_params = vec![
+        ("grant_type", "client_credentials".to_string()),
+        ("client_id", body.client_id.clone()),
+        ("client_secret", body.client_secret.clone()),
+    ];
+    if let Some(scopes) = &body.scopes {
+        if !scopes.is_empty() {
+            form_params.push(("scope", scopes.join(" ")));
+        }
+    } else if let Some(scopes) = &integration.oauth_scopes {
+        if !scopes.is_empty() {
+            form_params.push(("scope", scopes.join(" ")));
+        }
+    }
+
+    let http = reqwest::Client::new();
+    let token_resp = match http
+        .post(&token_url)
+        .form(&form_params)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(err = %e, "admin: client_credentials token request failed");
+            return (StatusCode::BAD_GATEWAY, "token endpoint request failed").into_response();
+        }
+    };
+
+    if !token_resp.status().is_success() {
+        let status = token_resp.status();
+        let err_body = token_resp.text().await.unwrap_or_default();
+        tracing::warn!(status = %status, body = %err_body, "admin: client_credentials token endpoint returned error");
+        return (StatusCode::BAD_GATEWAY, "token endpoint returned error").into_response();
+    }
+
+    let token_json: serde_json::Value = match token_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(err = %e, "admin: failed to parse token response");
+            return (StatusCode::BAD_GATEWAY, "invalid token response").into_response();
+        }
+    };
+
+    let access_token = token_json["access_token"].as_str().map(|s| s.to_string());
+    let token_type = token_json["token_type"].as_str().map(|s| s.to_string());
+    let expires_in = token_json["expires_in"].as_i64();
+    let now = unix_timestamp_secs();
+    let expires_at = expires_in.map(|e| now + e);
+
+    let vault_data = VaultTokenData {
+        client_secret: Some(body.client_secret.clone()),
+        access_token: access_token.clone(),
+        refresh_token: None,
+        token_type,
+        expires_at,
+    };
+
+    if let Err(e) = state.vault.store_token(&id, &vault_data).await {
+        tracing::error!(err = %e, "admin: failed to store vault token");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to store credentials").into_response();
+    }
+
+    // Mark integration as connected
+    if let Err(e) = state.db.update_integration_connected(&id, true).await {
+        tracing::warn!(err = %e, "admin: failed to mark integration as connected");
+    }
+
+    // Evict stale vault cache entry
+    state.vault_cache.remove(&id);
+
+    (StatusCode::OK, Json(serde_json::json!({ "connected": true }))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectAuthorizeQuery {
+    pub redirect_uri: Option<String>,
+}
+
+// POST /admin/integrations/{id}/connect/authorize — initiate auth code + PKCE flow
+pub async fn connect_authorize(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+    Query(query): Query<ConnectAuthorizeQuery>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    let integration = match state.db.get_integration(&id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error looking up integration");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+    };
+
+    let auth_url = match &integration.oauth_auth_url {
+        Some(u) => u.clone(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "integration has no oauth_auth_url").into_response();
+        }
+    };
+
+    let client_id = match &integration.oauth_client_id {
+        Some(c) => c.clone(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "integration has no oauth_client_id").into_response();
+        }
+    };
+
+    // Generate PKCE pair and state nonce
+    let code_verifier = crate::crypto::random_base64url(32);
+    let code_challenge = crate::crypto::pkce_challenge(&code_verifier);
+    let state_nonce = crate::crypto::random_base64url(16);
+    let now = unix_timestamp_secs();
+
+    let redirect_uri = query.redirect_uri.unwrap_or_else(|| {
+        // Default redirect — caller must configure this at the downstream
+        format!("/oauth/integrations/{id}/callback")
+    });
+
+    state.pending_integration_auth.insert(
+        state_nonce.clone(),
+        crate::handler::PendingIntegrationAuth {
+            integration_id: id.clone(),
+            state: state_nonce.clone(),
+            code_verifier,
+            created_at: now,
+        },
+    );
+
+    // Build the authorization URL
+    let mut url = format!(
+        "{auth_url}?response_type=code&client_id={client_id}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256&redirect_uri={redirect_uri}"
+    );
+    if let Some(scopes) = &integration.oauth_scopes {
+        if !scopes.is_empty() {
+            url.push_str(&format!("&scope={}", scopes.join("%20")));
+        }
+    }
+
+    Json(serde_json::json!({ "url": url })).into_response()
+}
+
+// GET /oauth/integrations/{id}/callback — receive auth code callback
+pub async fn integration_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = match params.get("code") {
+        Some(c) => c.clone(),
+        None => {
+            let error = params.get("error").map(|s| s.as_str()).unwrap_or("unknown");
+            return (StatusCode::BAD_REQUEST, format!("authorization denied: {error}")).into_response();
+        }
+    };
+
+    let state_param = match params.get("state") {
+        Some(s) => s.clone(),
+        None => return (StatusCode::BAD_REQUEST, "missing state parameter").into_response(),
+    };
+
+    let pending = match state.pending_integration_auth.remove(&state_param) {
+        Some((_, p)) => p,
+        None => return (StatusCode::BAD_REQUEST, "invalid or expired state").into_response(),
+    };
+
+    if pending.integration_id != id {
+        return (StatusCode::BAD_REQUEST, "state/integration mismatch").into_response();
+    }
+
+    let integration = match state.db.get_integration(&id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "callback: db error");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let token_url = match &integration.oauth_token_url {
+        Some(u) => u.clone(),
+        None => return (StatusCode::BAD_REQUEST, "integration has no oauth_token_url").into_response(),
+    };
+
+    let client_id = match &integration.oauth_client_id {
+        Some(c) => c.clone(),
+        None => return (StatusCode::BAD_REQUEST, "integration has no oauth_client_id").into_response(),
+    };
+
+    // Exchange code for tokens
+    let http = reqwest::Client::new();
+    let token_resp = match http
+        .post(&token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("client_id", &client_id),
+            ("code_verifier", &pending.code_verifier),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(err = %e, "callback: token exchange request failed");
+            return (StatusCode::BAD_GATEWAY, "token exchange failed").into_response();
+        }
+    };
+
+    if !token_resp.status().is_success() {
+        return (StatusCode::BAD_GATEWAY, "token endpoint returned error").into_response();
+    }
+
+    let token_json: serde_json::Value = match token_resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(err = %e, "callback: failed to parse token response");
+            return (StatusCode::BAD_GATEWAY, "invalid token response").into_response();
+        }
+    };
+
+    let access_token = token_json["access_token"].as_str().map(|s| s.to_string());
+    let refresh_token = token_json["refresh_token"].as_str().map(|s| s.to_string());
+    let token_type = token_json["token_type"].as_str().map(|s| s.to_string());
+    let expires_in = token_json["expires_in"].as_i64();
+    let now = unix_timestamp_secs();
+    let expires_at = expires_in.map(|e| now + e);
+
+    let vault_data = VaultTokenData {
+        client_secret: None,
+        access_token,
+        refresh_token,
+        token_type,
+        expires_at,
+    };
+
+    if let Err(e) = state.vault.store_token(&id, &vault_data).await {
+        tracing::error!(err = %e, "callback: failed to store vault token");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to store credentials").into_response();
+    }
+
+    if let Err(e) = state.db.update_integration_connected(&id, true).await {
+        tracing::warn!(err = %e, "callback: failed to mark integration as connected");
+    }
+
+    state.vault_cache.remove(&id);
+
+    (StatusCode::OK, "Integration connected successfully").into_response()
 }

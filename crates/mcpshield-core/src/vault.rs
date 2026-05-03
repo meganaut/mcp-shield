@@ -1,55 +1,34 @@
 use std::future::Future;
+use std::pin::Pin;
 
 use crate::error::CoreError;
-use crate::types::{IntegrationId, SubjectId};
 
-#[derive(Debug, Clone)]
-pub struct StoredToken {
-    pub access_token: String,
+/// Plaintext token data stored per integration. All fields optional — the vault
+/// stores whatever credentials were provided (client_secret, access_token,
+/// refresh_token, or a combination depending on the auth flow used).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct VaultTokenData {
+    pub client_secret: Option<String>,
+    pub access_token: Option<String>,
     pub refresh_token: Option<String>,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-    pub scopes: Vec<String>,
+    pub token_type: Option<String>,
+    pub expires_at: Option<i64>,
 }
 
 pub trait VaultBackend: Send + Sync {
     fn store_token(
         &self,
-        subject_id: &SubjectId,
-        integration_id: &IntegrationId,
-        token: StoredToken,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+        integration_id: &str,
+        data: &VaultTokenData,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send + '_>>;
 
     fn get_token(
         &self,
-        subject_id: &SubjectId,
-        integration_id: &IntegrationId,
-    ) -> impl Future<Output = Result<Option<StoredToken>, CoreError>> + Send;
+        integration_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<VaultTokenData>, CoreError>> + Send + '_>>;
 
     fn delete_token(
         &self,
-        subject_id: &SubjectId,
-        integration_id: &IntegrationId,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
-
-    /// Delete all tokens owned by a subject — used when an account is deactivated.
-    fn delete_all_tokens(
-        &self,
-        subject_id: &SubjectId,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
-
-    fn store_secret(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
-
-    fn get_secret(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<Option<String>, CoreError>> + Send;
-
-    fn delete_secret(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+        integration_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send + '_>>;
 }

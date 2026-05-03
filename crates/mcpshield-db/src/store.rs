@@ -68,6 +68,19 @@ pub trait Store: Send + Sync {
         limit: i64,
     ) -> Result<Vec<AuditEventRow>, StoreError>;
 
+    // --- Integrations ---
+    async fn insert_integration(&self, integration: &Integration) -> Result<(), StoreError>;
+    async fn get_integration(&self, id: &str) -> Result<Option<Integration>, StoreError>;
+    async fn get_integration_by_slug(&self, slug: &str) -> Result<Option<Integration>, StoreError>;
+    async fn list_integrations(&self) -> Result<Vec<Integration>, StoreError>;
+    async fn update_integration_connected(&self, id: &str, connected: bool) -> Result<(), StoreError>;
+    async fn delete_integration(&self, id: &str) -> Result<bool, StoreError>;
+
+    // --- Vault tokens ---
+    async fn upsert_vault_token(&self, token: &VaultToken) -> Result<(), StoreError>;
+    async fn get_vault_token(&self, integration_id: &str) -> Result<Option<VaultToken>, StoreError>;
+    async fn delete_vault_token(&self, integration_id: &str) -> Result<bool, StoreError>;
+
     // --- Policy rules ---
     async fn upsert_policy_rule(&self, rule: &PolicyRule) -> Result<(), StoreError>;
     /// Delete a policy rule. Returns true if deleted, false if it did not exist.

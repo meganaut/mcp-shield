@@ -38,6 +38,7 @@ rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
 constant_time_eq = "0.3"
+ring = "0.17"
 
 [dev-dependencies]
 mcpshield-test-support = { path = "../mcpshield-test-support" }
