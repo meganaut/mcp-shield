@@ -142,8 +142,8 @@ pub async fn post_register(
         .into_response()
 }
 
-/// Validate that a redirect URI is https:// or http://localhost[/...]
-/// and has no fragment (#).
+/// Validate that a redirect URI is https:// or a localhost loopback and has no fragment (#).
+/// Accepts http://localhost, http://127.0.0.1, and http://[::1] per RFC 8252 §8.3.
 pub fn is_valid_redirect_uri(uri: &str) -> bool {
     if uri.contains('#') {
         return false;
@@ -151,11 +151,11 @@ pub fn is_valid_redirect_uri(uri: &str) -> bool {
     if uri.starts_with("https://") {
         return true;
     }
-    if uri.starts_with("http://localhost") {
-        // Must be http://localhost followed by end-of-string, path, port, or nothing
-        // — reject bare '?' to avoid registering URIs with no path component
-        let rest = &uri["http://localhost".len()..];
-        return rest.is_empty() || rest.starts_with('/') || rest.starts_with(':');
+    for prefix in &["http://localhost", "http://127.0.0.1", "http://[::1]"] {
+        if uri.starts_with(prefix) {
+            let rest = &uri[prefix.len()..];
+            return rest.is_empty() || rest.starts_with('/') || rest.starts_with(':');
+        }
     }
     false
 }

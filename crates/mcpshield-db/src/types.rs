@@ -59,3 +59,13 @@ pub struct ClientAuthorizeInfo {
     pub redirect_uris: Vec<String>,
     pub client_name: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct AuditEventRow {
+    pub id: String,
+    pub timestamp_ms: i64,
+    pub agent_id: String,
+    pub operation_name: String,
+    pub outcome: String,
+    pub latency_ms: i64,
+}

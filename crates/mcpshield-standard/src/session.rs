@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 const SESSION_TTL: Duration = Duration::from_secs(86400); // 24 hours
 const MAX_SESSIONS: usize = 1000;
+/// Per-agent cap prevents a single agent from exhausting the global session pool.
+const MAX_SESSIONS_PER_AGENT: usize = 10;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -28,6 +30,11 @@ pub fn create_session(store: &SessionStore, agent_id: String) -> Result<String, 
 
     if store.len() >= MAX_SESSIONS {
         return Err("too many active sessions");
+    }
+
+    let agent_count = store.iter().filter(|e| e.agent_id == agent_id).count();
+    if agent_count >= MAX_SESSIONS_PER_AGENT {
+        return Err("too many sessions for this agent");
     }
 
     let id = Uuid::new_v4().to_string();

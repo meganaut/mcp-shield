@@ -7,14 +7,14 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use tokio::net::TcpListener;
 
-use crate::admin::{delete_agent, delete_policy, get_policy, list_agents, set_policy};
+use crate::admin::{delete_agent, delete_policy, get_policy, list_agents, revoke_agent_tokens, set_policy};
+use crate::audit::DbAuditSink;
 use crate::config::Config;
 use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
 use crate::handler::{
     mcp_handler_authenticated, new_pending_store, new_rate_limiter, new_setup_csrf_token, AppState,
 };
-use crate::noop::NoopAudit;
 use crate::oauth::authorize::{get_authorize, post_authorize};
 use crate::oauth::dcr::post_register;
 use crate::oauth::metadata::get_metadata;
@@ -57,7 +57,7 @@ pub async fn run(config: Config) -> Result<()> {
             sessions: new_store(),
             downstream,
             policy: Arc::new(DbPolicyEngine::new(Arc::clone(&db))),
-            audit: Arc::new(NoopAudit),
+            audit: Arc::new(DbAuditSink::new(Arc::clone(&db))),
             db: Arc::clone(&db),
             pending_auth: new_pending_store(),
             rate_limiter: new_rate_limiter(),
@@ -88,7 +88,7 @@ pub async fn run(config: Config) -> Result<()> {
         sessions: new_store(),
         downstream,
         policy: Arc::new(DbPolicyEngine::new(Arc::clone(&db))),
-        audit: Arc::new(NoopAudit),
+        audit: Arc::new(DbAuditSink::new(Arc::clone(&db))),
         db: Arc::clone(&db),
         pending_auth: new_pending_store(),
         rate_limiter: new_rate_limiter(),
@@ -119,6 +119,7 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/oauth/token", post(post_token))
         .route("/admin/agents", get(list_agents))
         .route("/admin/agents/{agent_id}", delete(delete_agent))
+        .route("/admin/agents/{agent_id}/tokens", delete(revoke_agent_tokens))
         .route("/admin/agents/{agent_id}/policy", get(get_policy).post(set_policy))
         .route("/admin/agents/{agent_id}/policy/{tool_name}", delete(delete_policy))
         .layer(DefaultBodyLimit::max(64 * 1024))

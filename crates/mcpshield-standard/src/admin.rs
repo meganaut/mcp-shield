@@ -178,6 +178,30 @@ pub async fn delete_agent(
     }
 }
 
+// DELETE /admin/agents/{agent_id}/tokens — revoke all active tokens without deleting the agent
+pub async fn revoke_agent_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+
+    match state.db.delete_agent_tokens(&agent_id).await {
+        Ok(count) => Json(serde_json::json!({ "revoked": count })).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error revoking tokens");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
 // GET /admin/agents/{agent_id}/policy
 pub async fn get_policy(
     State(state): State<Arc<AppState>>,

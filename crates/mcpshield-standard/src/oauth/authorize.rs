@@ -30,6 +30,8 @@ const MAX_STATE_BYTES: usize = 1024;
 
 /// S256 code_challenge is always base64url(SHA-256(verifier)) = 43 bytes
 const CODE_CHALLENGE_LEN: usize = 43;
+/// Abort an OAuth flow after this many consecutive credential failures.
+const MAX_AUTH_ATTEMPTS: u8 = 5;
 
 static LOGIN_FORM: &str = r#"<!DOCTYPE html>
 <html>
@@ -158,6 +160,7 @@ pub async fn get_authorize(
             state: state_param,
             agent_id,
             created_at: now,
+            attempts: 0,
         },
     );
 
@@ -299,8 +302,14 @@ fn append_query_params(base: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// On credential failure: re-insert a fresh pending entry so the user can retry
-/// without restarting the entire OAuth flow.
+/// without restarting the entire OAuth flow. After MAX_AUTH_ATTEMPTS failures,
+/// abort the flow entirely by redirecting with access_denied.
 async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, now: i64) -> Response {
+    let new_attempts = pending.attempts.saturating_add(1);
+    if new_attempts >= MAX_AUTH_ATTEMPTS {
+        return redirect_with_error(&pending.redirect_uri, "access_denied", Some(&pending.state));
+    }
+
     let name = state
         .db
         .get_client_name(&pending.client_id)
@@ -318,6 +327,7 @@ async fn render_auth_error(state: &Arc<AppState>, pending: &PendingAuthRequest, 
             state: pending.state.clone(),
             agent_id: pending.agent_id.clone(),
             created_at: now,
+            attempts: new_attempts,
         },
     );
 

@@ -11,6 +11,8 @@ use tokio::sync::RwLock;
 
 const MAX_PAGINATION_PAGES: usize = 100;
 const MAX_TOTAL_TOOLS: usize = 10_000;
+/// Cap downstream response bodies to prevent an OOM from a compromised upstream.
+const MAX_DOWNSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 pub struct DownstreamClient {
     http: reqwest::Client,
@@ -77,9 +79,14 @@ impl DownstreamClient {
             .filter(|s| !s.is_empty() && s.bytes().all(|b| (0x20..0x7f).contains(&b)))
             .map(|s| s.to_string());
 
-        let outcome: JsonRpcOutcome = response
-            .json()
+        let body = response
+            .bytes()
             .await
+            .context("downstream initialize response read failed")?;
+        if body.len() > MAX_DOWNSTREAM_BODY_BYTES {
+            anyhow::bail!("downstream initialize response exceeds size limit");
+        }
+        let outcome: JsonRpcOutcome = serde_json::from_slice(&body)
             .context("downstream initialize response parse failed")?;
 
         let init_result = match outcome {
@@ -174,9 +181,14 @@ impl DownstreamClient {
                 anyhow::bail!("downstream tools/list returned HTTP {}", resp.status());
             }
 
-            let outcome: JsonRpcOutcome = resp
-                .json()
+            let body = resp
+                .bytes()
                 .await
+                .context("downstream tools/list response read failed")?;
+            if body.len() > MAX_DOWNSTREAM_BODY_BYTES {
+                anyhow::bail!("downstream tools/list response exceeds size limit");
+            }
+            let outcome: JsonRpcOutcome = serde_json::from_slice(&body)
                 .context("downstream tools/list response parse failed")?;
 
             let json_resp = match outcome {
@@ -256,8 +268,14 @@ impl DownstreamClient {
             anyhow::bail!("downstream tools/call returned HTTP {}", resp.status());
         }
 
-        resp.json::<JsonRpcOutcome>()
+        let body = resp
+            .bytes()
             .await
+            .context("downstream tools/call response read failed")?;
+        if body.len() > MAX_DOWNSTREAM_BODY_BYTES {
+            anyhow::bail!("downstream tools/call response exceeds size limit");
+        }
+        serde_json::from_slice::<JsonRpcOutcome>(&body)
             .context("downstream tools/call response parse failed")
     }
 }

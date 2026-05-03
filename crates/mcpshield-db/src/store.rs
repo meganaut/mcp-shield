@@ -56,6 +56,18 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<TokenLookup>, StoreError>;
     async fn delete_expired_access_tokens(&self, now: i64) -> Result<u64, StoreError>;
 
+    // --- Access token revocation ---
+    /// Delete all access tokens for an agent. Returns the number deleted.
+    async fn delete_agent_tokens(&self, agent_id: &str) -> Result<u64, StoreError>;
+
+    // --- Audit log ---
+    async fn insert_audit_event(&self, event: &AuditEventRow) -> Result<(), StoreError>;
+    async fn list_audit_events(
+        &self,
+        agent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AuditEventRow>, StoreError>;
+
     // --- Policy rules ---
     async fn upsert_policy_rule(&self, rule: &PolicyRule) -> Result<(), StoreError>;
     /// Delete a policy rule. Returns true if deleted, false if it did not exist.

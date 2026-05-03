@@ -7,6 +7,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
+use chrono::Utc;
 use dashmap::DashMap;
 use mcpshield_core::audit::AuditSink;
 use mcpshield_core::mcp::{
@@ -15,7 +16,7 @@ use mcpshield_core::mcp::{
     ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, SUPPORTED_PROTOCOL_VERSION,
 };
 use mcpshield_core::policy::PolicyEngine;
-use mcpshield_core::types::{AgentId, IntegrationId};
+use mcpshield_core::types::{AgentId, AuditEvent, AuditOutcome, IntegrationId, McpPrimitive};
 use mcpshield_db::Store;
 use serde_json::json;
 use uuid::Uuid;
@@ -36,6 +37,8 @@ pub struct PendingAuthRequest {
     pub state: String,
     pub agent_id: String,
     pub created_at: i64,
+    /// Failed credential attempts on this specific OAuth flow.
+    pub attempts: u8,
 }
 
 pub type PendingAuthStore = Arc<DashMap<String, PendingAuthRequest>>;
@@ -504,6 +507,37 @@ async fn handle_initialize_with_agent(
         .expect("valid response headers")
 }
 
+/// Fire-and-forget audit emission. Errors are logged as warnings; they never fail the request.
+fn emit_audit(state: &Arc<AppState>, event: AuditEvent) {
+    let audit = Arc::clone(&state.audit);
+    tokio::spawn(async move {
+        if let Err(e) = audit.log_boxed(event).await {
+            tracing::warn!(err = %e, "audit: failed to log event");
+        }
+    });
+}
+
+fn tool_call_event(
+    agent_id: &AgentId,
+    integration_id: &IntegrationId,
+    slug: &str,
+    tool: &str,
+    outcome: AuditOutcome,
+    latency_ms: u64,
+) -> AuditEvent {
+    AuditEvent {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        agent_id: agent_id.clone(),
+        integration_id: Some(integration_id.clone()),
+        primitive: McpPrimitive::Tool,
+        operation_name: format!("{slug}__{tool}"),
+        outcome,
+        dlp_detections: vec![],
+        latency_ms,
+    }
+}
+
 async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: String) -> Response {
     let req_id = match require_id(&req) {
         Ok(id) => id,
@@ -577,7 +611,7 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         Err(resp) => return resp,
     };
 
-    let _call_start = std::time::Instant::now(); // captured for future audit logging
+    let call_start = std::time::Instant::now();
 
     let params: mcpshield_core::mcp::ToolCallParams =
         match req.params.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok()) {
@@ -647,6 +681,18 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     };
 
     if !decision.allowed {
+        let latency_ms = call_start.elapsed().as_millis() as u64;
+        emit_audit(
+            &state,
+            tool_call_event(
+                &parsed_agent_id,
+                &integration_id,
+                state.downstream.slug(),
+                local_name,
+                AuditOutcome::Denied { reason: "policy deny".to_string() },
+                latency_ms,
+            ),
+        );
         return error_json(error_response(
             Some(req_id),
             ERR_INVALID_REQUEST,
@@ -656,6 +702,18 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
 
     match state.downstream.call_tool(local_name, params.arguments).await {
         Ok(JsonRpcOutcome::Success(downstream_resp)) => {
+            let latency_ms = call_start.elapsed().as_millis() as u64;
+            emit_audit(
+                &state,
+                tool_call_event(
+                    &parsed_agent_id,
+                    &integration_id,
+                    state.downstream.slug(),
+                    local_name,
+                    AuditOutcome::Allowed,
+                    latency_ms,
+                ),
+            );
             let resp = JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: req_id,
@@ -664,6 +722,19 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
             json_response(resp)
         }
         Ok(JsonRpcOutcome::Error(downstream_err)) => {
+            let latency_ms = call_start.elapsed().as_millis() as u64;
+            // The downstream returned a JSON-RPC error — the call was allowed and executed.
+            emit_audit(
+                &state,
+                tool_call_event(
+                    &parsed_agent_id,
+                    &integration_id,
+                    state.downstream.slug(),
+                    local_name,
+                    AuditOutcome::Allowed,
+                    latency_ms,
+                ),
+            );
             error_json(JsonRpcError {
                 jsonrpc: "2.0".to_string(),
                 id: Some(req_id),
@@ -671,7 +742,19 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
             })
         }
         Err(e) => {
+            let latency_ms = call_start.elapsed().as_millis() as u64;
             tracing::error!(err = %e, "tools/call: downstream error");
+            emit_audit(
+                &state,
+                tool_call_event(
+                    &parsed_agent_id,
+                    &integration_id,
+                    state.downstream.slug(),
+                    local_name,
+                    AuditOutcome::Error { detail: "downstream unavailable".to_string() },
+                    latency_ms,
+                ),
+            );
             error_json(error_response(Some(req_id), ERR_INTERNAL, "downstream unavailable"))
         }
     }

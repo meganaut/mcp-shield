@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mcpshield_db::{
-    AccessToken, AuthCode, ClientAuthInfo, ClientAuthorizeInfo, OAuthClient, PolicyRule, Store,
-    StoreError, TokenLookup,
+    AccessToken, AuditEventRow, AuthCode, ClientAuthInfo, ClientAuthorizeInfo, OAuthClient,
+    PolicyRule, Store, StoreError, TokenLookup,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -306,6 +306,55 @@ impl Store for SqliteStore {
             .await
             .map_err(store_err)?;
         Ok(result.rows_affected())
+    }
+
+    async fn delete_agent_tokens(&self, agent_id: &str) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM access_tokens WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn insert_audit_event(&self, event: &AuditEventRow) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (id, timestamp_ms, agent_id, operation_name, outcome, latency_ms) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&event.id)
+        .bind(event.timestamp_ms)
+        .bind(&event.agent_id)
+        .bind(&event.operation_name)
+        .bind(&event.outcome)
+        .bind(event.latency_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_audit_events(
+        &self,
+        agent_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AuditEventRow>, StoreError> {
+        let rows: Vec<(String, i64, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, timestamp_ms, agent_id, operation_name, outcome, latency_ms \
+             FROM audit_events WHERE agent_id = ? ORDER BY timestamp_ms DESC LIMIT ?",
+        )
+        .bind(agent_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, timestamp_ms, agent_id, operation_name, outcome, latency_ms)| {
+                AuditEventRow { id, timestamp_ms, agent_id, operation_name, outcome, latency_ms }
+            })
+            .collect())
     }
 
     async fn insert_access_token(&self, token: &AccessToken) -> Result<(), StoreError> {
