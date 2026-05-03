@@ -3,14 +3,18 @@ use std::sync::Arc;
 
 use axum::routing::post;
 use axum::Router;
+use dashmap::DashMap;
 use mcpshield_core::mcp::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, Tool, SUPPORTED_PROTOCOL_VERSION,
 };
 use mcpshield_db::Store;
 use mcpshield_standard::handler::{
-    mcp_handler_no_auth, new_pending_store, new_rate_limiter, new_setup_csrf_token, AppState,
+    mcp_handler_no_auth, new_pending_store, new_pending_integration_auth_store,
+    new_rate_limiter, new_setup_csrf_token, AppState,
 };
-use mcpshield_standard::noop::{NoopAudit, NoopPolicy};
+use mcpshield_standard::noop::NoopAudit;
+use mcpshield_standard::policy_cache::CachingPolicyEngine;
+use mcpshield_standard::noop::NoopPolicy;
 use mcpshield_standard::session::new_store;
 use mcpshield_standard::downstream::DownstreamClient;
 use mcpshield_test_support::MockMcpServer;
@@ -26,24 +30,51 @@ async fn make_test_db() -> Arc<dyn mcpshield_db::Store> {
     Arc::new(store) as Arc<dyn mcpshield_db::Store>
 }
 
+// Minimal NoopVault for tests
+struct NoopVault;
+impl mcpshield_core::vault::VaultBackend for NoopVault {
+    fn store_token(
+        &self, _: &str, _: &mcpshield_core::vault::VaultTokenData,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn get_token(
+        &self, _: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<mcpshield_core::vault::VaultTokenData>, mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn delete_token(
+        &self, _: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
+    let integration_id = uuid::Uuid::new_v4().to_string();
     let downstream = Arc::new(
-        DownstreamClient::new(mock_url, slug.to_string()).expect("build downstream"),
+        DownstreamClient::new(mock_url, slug.to_string(), integration_id).expect("build downstream"),
     );
-    downstream.initialize().await.expect("downstream init");
+    downstream.initialize(None).await.expect("downstream init");
 
     let db = make_test_db().await;
+    let downstreams = Arc::new(DashMap::new());
+    downstreams.insert(slug.to_string(), Arc::clone(&downstream));
 
     let state = Arc::new(AppState {
         sessions: new_store(),
-        downstream,
-        policy: Arc::new(NoopPolicy),
+        downstreams,
+        policy: Arc::new(CachingPolicyEngine::new(Arc::new(NoopPolicy))),
         audit: Arc::new(NoopAudit),
         db,
+        vault: Arc::new(NoopVault),
         pending_auth: new_pending_store(),
+        pending_integration_auth: new_pending_integration_auth_store(),
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        bearer_cache: Arc::new(DashMap::new()),
+        vault_cache: Arc::new(DashMap::new()),
     });
 
     let app = Router::new()

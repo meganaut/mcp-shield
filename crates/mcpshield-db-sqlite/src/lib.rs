@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use mcpshield_db::{
-    AccessToken, AuditEventRow, AuthCode, ClientAuthInfo, ClientAuthorizeInfo, OAuthClient,
-    PolicyRule, Store, StoreError, TokenLookup,
+    AccessToken, AuditEventRow, AuthCode, ClientAuthInfo, ClientAuthorizeInfo, Integration,
+    OAuthClient, PolicyRule, Store, StoreError, TokenLookup, VaultToken,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -379,8 +379,8 @@ impl Store for SqliteStore {
         token_hash: &str,
         now: i64,
     ) -> Result<Option<TokenLookup>, StoreError> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT agent_id, client_id FROM access_tokens \
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT agent_id, client_id, expires_at FROM access_tokens \
              WHERE token_hash = ? AND expires_at > ?",
         )
         .bind(token_hash)
@@ -388,7 +388,7 @@ impl Store for SqliteStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(store_err)?;
-        Ok(row.map(|(agent_id, client_id)| TokenLookup { agent_id, client_id }))
+        Ok(row.map(|(agent_id, client_id, expires_at)| TokenLookup { agent_id, client_id, expires_at }))
     }
 
     async fn delete_expired_access_tokens(&self, now: i64) -> Result<u64, StoreError> {
@@ -474,4 +474,152 @@ impl Store for SqliteStore {
             created_at,
         }))
     }
+
+    async fn insert_integration(&self, integration: &Integration) -> Result<(), StoreError> {
+        let scopes_json = match &integration.oauth_scopes {
+            Some(s) => Some(serde_json::to_string(s).map_err(store_err)?),
+            None => None,
+        };
+        let connected: i64 = if integration.connected { 1 } else { 0 };
+        sqlx::query(
+            "INSERT INTO integrations \
+             (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&integration.id)
+        .bind(&integration.slug)
+        .bind(&integration.name)
+        .bind(&integration.mcp_url)
+        .bind(&integration.oauth_auth_url)
+        .bind(&integration.oauth_token_url)
+        .bind(&integration.oauth_client_id)
+        .bind(&scopes_json)
+        .bind(connected)
+        .bind(integration.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err_db)?;
+        Ok(())
+    }
+
+    async fn get_integration(&self, id: &str) -> Result<Option<Integration>, StoreError> {
+        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+            sqlx::query_as(
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                 FROM integrations WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err)?;
+        row.map(|r| parse_integration_row(r)).transpose()
+    }
+
+    async fn get_integration_by_slug(&self, slug: &str) -> Result<Option<Integration>, StoreError> {
+        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+            sqlx::query_as(
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                 FROM integrations WHERE slug = ?",
+            )
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_err)?;
+        row.map(|r| parse_integration_row(r)).transpose()
+    }
+
+    async fn list_integrations(&self) -> Result<Vec<Integration>, StoreError> {
+        let rows: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+            sqlx::query_as(
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                 FROM integrations ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_err)?;
+        rows.into_iter().map(|r| parse_integration_row(r)).collect()
+    }
+
+    async fn update_integration_connected(&self, id: &str, connected: bool) -> Result<(), StoreError> {
+        let connected_int: i64 = if connected { 1 } else { 0 };
+        sqlx::query("UPDATE integrations SET connected = ? WHERE id = ?")
+            .bind(connected_int)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_integration(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM integrations WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn upsert_vault_token(&self, token: &VaultToken) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO vault_tokens \
+             (id, integration_id, nonce, ciphertext, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&token.id)
+        .bind(&token.integration_id)
+        .bind(&token.nonce)
+        .bind(&token.ciphertext)
+        .bind(token.expires_at)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn get_vault_token(&self, integration_id: &str) -> Result<Option<VaultToken>, StoreError> {
+        let row: Option<(String, String, Vec<u8>, Vec<u8>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT id, integration_id, nonce, ciphertext, expires_at, created_at \
+             FROM vault_tokens WHERE integration_id = ?",
+        )
+        .bind(integration_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.map(|(id, integration_id, nonce, ciphertext, expires_at, created_at)| {
+            VaultToken { id, integration_id, nonce, ciphertext, expires_at, created_at }
+        }))
+    }
+
+    async fn delete_vault_token(&self, integration_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM vault_tokens WHERE integration_id = ?")
+            .bind(integration_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+fn parse_integration_row(
+    row: (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64),
+) -> Result<Integration, StoreError> {
+    let (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes_json, connected, created_at) = row;
+    let oauth_scopes = match oauth_scopes_json {
+        Some(json) => Some(serde_json::from_str::<Vec<String>>(&json).map_err(store_err)?),
+        None => None,
+    };
+    Ok(Integration {
+        id,
+        slug,
+        name,
+        mcp_url,
+        oauth_auth_url,
+        oauth_token_url,
+        oauth_client_id,
+        oauth_scopes,
+        connected: connected != 0,
+        created_at,
+    })
 }

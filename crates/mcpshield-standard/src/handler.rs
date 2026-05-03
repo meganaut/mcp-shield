@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::request::Parts;
@@ -17,12 +18,14 @@ use mcpshield_core::mcp::{
 };
 use mcpshield_core::policy::PolicyEngine;
 use mcpshield_core::types::{AgentId, AuditEvent, AuditOutcome, IntegrationId, McpPrimitive};
+use mcpshield_core::vault::{VaultBackend, VaultTokenData};
 use mcpshield_db::Store;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
+use crate::policy_cache::CachingPolicyEngine;
 use crate::session::{create_session, get_session, SessionStore};
 
 /// Maximum length for an Mcp-Session-Id header value. UUIDv4 is 36 chars; 128 is generous.
@@ -47,18 +50,28 @@ pub fn new_pending_store() -> PendingAuthStore {
     Arc::new(DashMap::new())
 }
 
+/// Pending outbound OAuth state for connecting an integration.
+#[derive(Debug, Clone)]
+pub struct PendingIntegrationAuth {
+    pub integration_id: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub created_at: i64,
+}
+
+pub type PendingIntegrationAuthStore = Arc<DashMap<String, PendingIntegrationAuth>>;
+
+pub fn new_pending_integration_auth_store() -> PendingIntegrationAuthStore {
+    Arc::new(DashMap::new())
+}
+
 /// Per-IP sliding-window rate limiter for credential-checking endpoints.
-/// Tracks timestamps of recent failures; rejects when the count in the window exceeds the cap.
-/// Note: the allow/record_failure pair is not atomic, so the effective limit under concurrent
-/// load is approximately RATE_MAX_FAILURES × tokio-worker-count. This is a known and accepted
-/// trade-off for a DashMap-based implementation.
 pub struct RateLimiter {
     failures: DashMap<String, Vec<i64>>,
 }
 
 const RATE_WINDOW_SECS: i64 = 60;
 const RATE_MAX_FAILURES: usize = 10;
-/// Global cap on tracked IPs; evict all fully-stale entries when exceeded.
 const RATE_MAX_ENTRIES: usize = 50_000;
 
 impl RateLimiter {
@@ -68,7 +81,6 @@ impl RateLimiter {
         }
     }
 
-    /// Return false if this IP has exceeded the failure limit in the current window.
     pub fn allow(&self, ip: &str, now: i64) -> bool {
         if let Some(entry) = self.failures.get(ip) {
             entry
@@ -81,8 +93,6 @@ impl RateLimiter {
         }
     }
 
-    /// Record one failed attempt. Prunes stale entries from this IP.
-    /// Also evicts fully-stale IPs when the global map exceeds RATE_MAX_ENTRIES.
     pub fn record_failure(&self, ip: &str, now: i64) {
         if self.failures.len() >= RATE_MAX_ENTRIES {
             self.failures
@@ -93,7 +103,6 @@ impl RateLimiter {
         entry.push(now);
     }
 
-    /// Clear failure history on successful auth.
     pub fn record_success(&self, ip: &str) {
         self.failures.remove(ip);
     }
@@ -105,14 +114,11 @@ pub fn new_rate_limiter() -> RateLimiterStore {
     Arc::new(RateLimiter::new())
 }
 
-/// Extract the real peer IP from the ConnectInfo extension set by axum or the TLS accept loop.
-/// Never trusts X-Forwarded-For — that header is trivially spoofable by any client.
+/// Extract the real peer IP from the ConnectInfo extension.
 pub fn extract_client_ip(peer_ip: Option<IpAddr>) -> String {
     peer_ip.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Axum extractor that reads the peer IP from the ConnectInfo extension.
-/// Returns None when ConnectInfo is not present (e.g. in unit tests).
 #[derive(Debug, Clone)]
 pub struct PeerIp(pub Option<IpAddr>);
 
@@ -132,16 +138,20 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
 
 pub struct AppState {
     pub sessions: SessionStore,
-    pub downstream: Arc<DownstreamClient>,
-    pub policy: Arc<dyn PolicyEngine>,
+    pub downstreams: Arc<DashMap<String, Arc<DownstreamClient>>>,
+    pub policy: Arc<CachingPolicyEngine>,
     pub audit: Arc<dyn AuditSink>,
     pub db: Arc<dyn Store>,
+    pub vault: Arc<dyn VaultBackend>,
     pub pending_auth: PendingAuthStore,
-    /// Rate limiter for OAuth credential endpoints (authorize, token).
+    pub pending_integration_auth: PendingIntegrationAuthStore,
     pub rate_limiter: RateLimiterStore,
-    /// Separate rate limiter for admin endpoints — success on OAuth must not reset admin failures.
     pub admin_rate_limiter: RateLimiterStore,
     pub setup_csrf_token: String,
+    /// token_hash → (agent_id, client_id, expiry_unix_secs)
+    pub bearer_cache: Arc<DashMap<String, (String, String, i64)>>,
+    /// integration_id → (token_data, cached_at)
+    pub vault_cache: Arc<DashMap<String, (VaultTokenData, Instant)>>,
 }
 
 pub fn new_setup_csrf_token() -> String {
@@ -155,8 +165,7 @@ pub struct AuthenticatedAgent {
     pub client_id: String,
 }
 
-/// Unauthenticated MCP handler — **test use only**. Do not register as a production route;
-/// doing so bypasses bearer-token enforcement.
+/// Unauthenticated MCP handler — **test use only**.
 pub async fn mcp_handler_no_auth(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -198,7 +207,6 @@ pub async fn mcp_handler_no_auth(
             notification_ack()
         }
         method => {
-            // Cap session-id header before doing any DashMap work to prevent large-allocation DoS.
             let session_id = headers
                 .get("mcp-session-id")
                 .and_then(|v| v.to_str().ok())
@@ -274,11 +282,29 @@ pub async fn authenticate_bearer(
     let token_hash = crate::crypto::sha256_hex(&token);
     let now = unix_timestamp_secs();
 
+    // Cache check
+    if let Some(entry) = state.bearer_cache.get(&token_hash) {
+        let (agent_id, client_id, expiry) = entry.clone();
+        if now < expiry {
+            return Ok(AuthenticatedAgent { agent_id, client_id });
+        }
+        drop(entry);
+        state.bearer_cache.remove(&token_hash);
+    }
+
+    // DB fallback
     match state.db.get_token_by_hash(&token_hash, now).await {
-        Ok(Some(lookup)) => Ok(AuthenticatedAgent {
-            agent_id: lookup.agent_id,
-            client_id: lookup.client_id,
-        }),
+        Ok(Some(lookup)) => {
+            let cache_ttl = std::cmp::min(now + 60, lookup.expires_at);
+            state.bearer_cache.insert(
+                token_hash,
+                (lookup.agent_id.clone(), lookup.client_id.clone(), cache_ttl),
+            );
+            Ok(AuthenticatedAgent {
+                agent_id: lookup.agent_id,
+                client_id: lookup.client_id,
+            })
+        }
         Ok(None) => Err(axum::http::Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("content-type", "application/json")
@@ -463,7 +489,16 @@ async fn handle_initialize_with_agent(
         );
     }
 
-    let mut capabilities = state.downstream.capabilities().await;
+    // Aggregate capabilities from all downstreams (or provide default tools capability)
+    let mut capabilities = json!({});
+    for entry in state.downstreams.iter() {
+        let downstream_caps = entry.value().capabilities().await;
+        if let (Some(obj), Some(downstream_obj)) = (capabilities.as_object_mut(), downstream_caps.as_object()) {
+            for (k, v) in downstream_obj {
+                obj.entry(k).or_insert_with(|| v.clone());
+            }
+        }
+    }
     if let Some(obj) = capabilities.as_object_mut() {
         obj.entry("tools").or_insert(json!({}));
     }
@@ -507,7 +542,6 @@ async fn handle_initialize_with_agent(
         .expect("valid response headers")
 }
 
-/// Fire-and-forget audit emission. Errors are logged as warnings; they never fail the request.
 fn emit_audit(state: &Arc<AppState>, event: AuditEvent) {
     let audit = Arc::clone(&state.audit);
     tokio::spawn(async move {
@@ -543,10 +577,7 @@ async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    let slug = state.downstream.slug();
-    let raw_tools = state.downstream.list_tools().await;
 
-    // Parse agent_id UUID for policy check
     let parsed_agent_id = match Uuid::parse_str(&agent_id) {
         Ok(u) => AgentId(u),
         Err(_) => {
@@ -558,30 +589,41 @@ async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         }
     };
     let integration_id = IntegrationId(Uuid::nil());
-    let tool_names: Vec<String> = raw_tools.iter().map(|t| t.name.clone()).collect();
 
-    // Batch policy check — PolicyEngine implementations backed by a DB do this in a single query.
-    let allowed_names: HashSet<String> = match state
-        .policy
-        .list_allowed_boxed(&parsed_agent_id, &integration_id, &tool_names)
-        .await
-    {
-        Ok(set) => set,
-        Err(e) => {
-            tracing::error!(err = %e, "tools/list: policy evaluation error");
-            return error_json(error_response(Some(req_id), ERR_INTERNAL, "internal error"));
+    let mut namespaced = Vec::new();
+
+    for entry in state.downstreams.iter() {
+        let slug = entry.key().clone();
+        let downstream = entry.value().clone();
+        let raw_tools = downstream.list_tools().await;
+
+        // Build namespaced tool names for the policy batch check
+        let namespaced_names: Vec<String> = raw_tools
+            .iter()
+            .map(|t| format!("{slug}__{}", t.name))
+            .collect();
+
+        let allowed_names: HashSet<String> = match state
+            .policy
+            .list_allowed_boxed(&parsed_agent_id, &integration_id, &namespaced_names)
+            .await
+        {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::error!(err = %e, slug = %slug, "tools/list: policy evaluation error");
+                return error_json(error_response(Some(req_id), ERR_INTERNAL, "internal error"));
+            }
+        };
+
+        for t in raw_tools.iter() {
+            let namespaced_name = format!("{slug}__{}", t.name);
+            if allowed_names.contains(&namespaced_name) {
+                let mut tool = t.clone();
+                tool.name = namespaced_name;
+                namespaced.push(tool);
+            }
         }
-    };
-
-    let namespaced: Vec<_> = raw_tools
-        .iter()
-        .filter(|t| allowed_names.contains(&t.name))
-        .map(|t| {
-            let mut t = t.clone();
-            t.name = format!("{slug}__{}", t.name);
-            t
-        })
-        .collect();
+    }
 
     let result = ToolsListResult {
         tools: namespaced,
@@ -638,15 +680,18 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         }
     };
 
-    if tool_slug != state.downstream.slug() {
-        return error_json(error_response(
-            Some(req_id),
-            ERR_METHOD_NOT_FOUND,
-            format!("unknown integration: {tool_slug}"),
-        ));
-    }
+    let downstream = match state.downstreams.get(tool_slug) {
+        Some(d) => d.clone(),
+        None => {
+            return error_json(error_response(
+                Some(req_id),
+                ERR_METHOD_NOT_FOUND,
+                format!("unknown integration: {tool_slug}"),
+            ));
+        }
+    };
 
-    let known_tools = state.downstream.list_tools().await;
+    let known_tools = downstream.list_tools().await;
     if !known_tools.iter().any(|t| t.name == local_name) {
         return error_json(error_response(
             Some(req_id),
@@ -668,9 +713,10 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     let integration_id = IntegrationId(Uuid::nil());
     let call_params = params.arguments.clone().unwrap_or(serde_json::Value::Null);
 
+    // Policy check uses the full namespaced name
     let decision = match state
         .policy
-        .evaluate_boxed(&parsed_agent_id, &integration_id, local_name, &call_params)
+        .evaluate_boxed(&parsed_agent_id, &integration_id, tool_name, &call_params)
         .await
     {
         Ok(d) => d,
@@ -687,7 +733,7 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
             tool_call_event(
                 &parsed_agent_id,
                 &integration_id,
-                state.downstream.slug(),
+                tool_slug,
                 local_name,
                 AuditOutcome::Denied { reason: "policy deny".to_string() },
                 latency_ms,
@@ -700,7 +746,10 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         ));
     }
 
-    match state.downstream.call_tool(local_name, params.arguments).await {
+    // Get auth token from vault cache (non-fatal — None means no auth header)
+    let auth_token = get_vault_token_cached(&state, &downstream.integration_id).await;
+
+    match downstream.call_tool(local_name, params.arguments, auth_token.as_deref()).await {
         Ok(JsonRpcOutcome::Success(downstream_resp)) => {
             let latency_ms = call_start.elapsed().as_millis() as u64;
             emit_audit(
@@ -708,7 +757,7 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
                 tool_call_event(
                     &parsed_agent_id,
                     &integration_id,
-                    state.downstream.slug(),
+                    tool_slug,
                     local_name,
                     AuditOutcome::Allowed,
                     latency_ms,
@@ -723,13 +772,12 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
         }
         Ok(JsonRpcOutcome::Error(downstream_err)) => {
             let latency_ms = call_start.elapsed().as_millis() as u64;
-            // The downstream returned a JSON-RPC error — the call was allowed and executed.
             emit_audit(
                 &state,
                 tool_call_event(
                     &parsed_agent_id,
                     &integration_id,
-                    state.downstream.slug(),
+                    tool_slug,
                     local_name,
                     AuditOutcome::Allowed,
                     latency_ms,
@@ -749,13 +797,56 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
                 tool_call_event(
                     &parsed_agent_id,
                     &integration_id,
-                    state.downstream.slug(),
+                    tool_slug,
                     local_name,
                     AuditOutcome::Error { detail: "downstream unavailable".to_string() },
                     latency_ms,
                 ),
             );
             error_json(error_response(Some(req_id), ERR_INTERNAL, "downstream unavailable"))
+        }
+    }
+}
+
+/// Look up a vault access_token for an integration. Returns None if no token stored or token expired.
+async fn get_vault_token_cached(state: &Arc<AppState>, integration_id: &str) -> Option<String> {
+    let now = unix_timestamp_secs();
+
+    // Check cache
+    if let Some(entry) = state.vault_cache.get(integration_id) {
+        let (data, cached_at) = entry.value().clone();
+        // Evict if cached more than 5 minutes ago, or if token itself is expired
+        if cached_at.elapsed().as_secs() < 300 {
+            if let Some(expires_at) = data.expires_at {
+                if now < expires_at {
+                    return data.access_token;
+                }
+                // Token expired — fall through to evict
+            } else {
+                return data.access_token;
+            }
+        }
+        drop(entry);
+        state.vault_cache.remove(integration_id);
+    }
+
+    // Fetch from vault
+    match state.vault.get_token(integration_id).await {
+        Ok(Some(data)) => {
+            // Don't cache if already expired
+            if let Some(expires_at) = data.expires_at {
+                if now >= expires_at {
+                    return None;
+                }
+            }
+            let token = data.access_token.clone();
+            state.vault_cache.insert(integration_id.to_string(), (data, Instant::now()));
+            token
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(err = %e, integration_id = %integration_id, "vault: failed to get token");
+            None
         }
     }
 }

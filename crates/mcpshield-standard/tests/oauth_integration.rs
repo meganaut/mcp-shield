@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{delete, get, post};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use dashmap::DashMap;
 use mcpshield_core::mcp::{JsonRpcRequest, JsonRpcResponse, RequestId, Tool, SUPPORTED_PROTOCOL_VERSION};
 use mcpshield_db::Store;
 use mcpshield_db_sqlite::SqliteStore;
@@ -10,7 +11,8 @@ use mcpshield_policy_db::DbPolicyEngine;
 use mcpshield_standard::admin::{delete_policy, get_policy, list_agents, set_policy};
 use mcpshield_standard::downstream::DownstreamClient;
 use mcpshield_standard::handler::{
-    mcp_handler_authenticated, new_pending_store, new_rate_limiter, new_setup_csrf_token, AppState,
+    mcp_handler_authenticated, new_pending_store, new_pending_integration_auth_store,
+    new_rate_limiter, new_setup_csrf_token, AppState,
 };
 use std::net::SocketAddr;
 use mcpshield_standard::noop::NoopAudit;
@@ -18,11 +20,31 @@ use mcpshield_standard::oauth::authorize::{get_authorize, post_authorize};
 use mcpshield_standard::oauth::dcr::post_register;
 use mcpshield_standard::oauth::metadata::get_metadata;
 use mcpshield_standard::oauth::token::post_token;
+use mcpshield_standard::policy_cache::CachingPolicyEngine;
 use mcpshield_standard::session::new_store;
 use mcpshield_test_support::MockMcpServer;
 use rand::RngCore;
 use serde_json::json;
 use tokio::net::TcpListener;
+
+struct NoopVault;
+impl mcpshield_core::vault::VaultBackend for NoopVault {
+    fn store_token(
+        &self, _: &str, _: &mcpshield_core::vault::VaultTokenData,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn get_token(
+        &self, _: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<mcpshield_core::vault::VaultTokenData>, mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn delete_token(
+        &self, _: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), mcpshield_core::error::CoreError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
@@ -57,23 +79,31 @@ async fn start_gateway(tools: Vec<Tool>) -> (String, Arc<dyn Store>) {
 
     let db = make_db("http://localhost").await;
 
+    let integration_id = uuid::Uuid::new_v4().to_string();
     let downstream = Arc::new(
-        DownstreamClient::new(mock.url(), "fs".to_string()).expect("build downstream"),
+        DownstreamClient::new(mock.url(), "fs".to_string(), integration_id).expect("build downstream"),
     );
-    downstream.initialize().await.expect("downstream init");
+    downstream.initialize(None).await.expect("downstream init");
 
-    let policy = Arc::new(DbPolicyEngine::new(Arc::clone(&db)));
+    let downstreams = Arc::new(DashMap::new());
+    downstreams.insert("fs".to_string(), Arc::clone(&downstream));
+
+    let policy = Arc::new(CachingPolicyEngine::new(Arc::new(DbPolicyEngine::new(Arc::clone(&db)))));
 
     let state = Arc::new(AppState {
         sessions: new_store(),
-        downstream,
+        downstreams,
         policy,
         audit: Arc::new(NoopAudit),
         db: Arc::clone(&db),
+        vault: Arc::new(NoopVault),
         pending_auth: new_pending_store(),
+        pending_integration_auth: new_pending_integration_auth_store(),
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        bearer_cache: Arc::new(DashMap::new()),
+        vault_cache: Arc::new(DashMap::new()),
     });
 
     let app = Router::new()
@@ -427,11 +457,11 @@ async fn test_full_oauth_flow() {
     let token = do_token_exchange(&base_url, &client_id, &client_secret, &code, &verifier).await;
     assert!(!token.is_empty(), "access token must be non-empty");
 
-    // 4. Add allow policy for "ping" tool via admin API
+    // 4. Add allow policy for "fs__ping" tool via admin API (namespaced)
     let policy_resp = reqwest::Client::new()
         .post(format!("{base_url}/admin/agents/{agent_id}/policy"))
         .basic_auth("admin", Some("testpassword1234!"))
-        .json(&json!({"tool_name": "ping", "allowed": true}))
+        .json(&json!({"tool_name": "fs__ping", "allowed": true}))
         .send()
         .await
         .unwrap();
@@ -607,11 +637,11 @@ async fn test_policy_allow_via_admin_api() {
     let code = do_authorize(&base_url, &client, &client_id, &challenge, "s2").await;
     let token = do_token_exchange(&base_url, &client_id, &client_secret, &code, &verifier).await;
 
-    // Add allow rule via admin API
+    // Add allow rule via admin API (namespaced tool name)
     let admin_resp = client
         .post(format!("{base_url}/admin/agents/{agent_id}/policy"))
         .basic_auth("admin", Some("testpassword1234!"))
-        .json(&json!({"tool_name": "read_file", "allowed": true}))
+        .json(&json!({"tool_name": "fs__read_file", "allowed": true}))
         .send()
         .await
         .unwrap();

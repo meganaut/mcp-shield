@@ -6,8 +6,10 @@ pub mod downstream;
 pub mod handler;
 pub mod noop;
 pub mod oauth;
+pub mod policy_cache;
 pub mod server;
 pub mod session;
 pub mod setup;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod vault;

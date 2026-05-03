@@ -18,6 +18,7 @@ pub struct DownstreamClient {
     http: reqwest::Client,
     url: String,
     slug: String,
+    pub integration_id: String,
     next_id: AtomicU64,
     session_id: RwLock<Option<String>>,
     tools: RwLock<Arc<Vec<Tool>>>,
@@ -25,7 +26,7 @@ pub struct DownstreamClient {
 }
 
 impl DownstreamClient {
-    pub fn new(url: String, slug: String) -> anyhow::Result<Self> {
+    pub fn new(url: String, slug: String, integration_id: String) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
@@ -35,6 +36,7 @@ impl DownstreamClient {
             http,
             url,
             slug,
+            integration_id,
             next_id: AtomicU64::new(1),
             session_id: RwLock::new(None),
             tools: RwLock::new(Arc::new(Vec::new())),
@@ -46,7 +48,7 @@ impl DownstreamClient {
         RequestId::Number(self.next_id.fetch_add(1, Ordering::AcqRel) as i64)
     }
 
-    pub async fn initialize(&self) -> Result<()> {
+    pub async fn initialize(&self, auth_token: Option<&str>) -> Result<()> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(self.next_id()),
@@ -58,10 +60,9 @@ impl DownstreamClient {
             })),
         };
 
+        let builder = self.http.post(format!("{}/mcp", self.url)).json(&req);
         let response = self
-            .http
-            .post(format!("{}/mcp", self.url))
-            .json(&req)
+            .add_auth(builder, auth_token)
             .send()
             .await
             .context("downstream initialize request failed")?;
@@ -70,8 +71,6 @@ impl DownstreamClient {
             anyhow::bail!("downstream initialize returned HTTP {}", response.status());
         }
 
-        // Validate the session ID before storing — reject any value with non-printable
-        // ASCII or CRLF characters that could cause header injection downstream.
         let session_id = response
             .headers()
             .get("mcp-session-id")
@@ -102,12 +101,12 @@ impl DownstreamClient {
         *self.capabilities.write().await = init_result.capabilities;
         *self.session_id.write().await = session_id;
 
-        self.send_initialized().await?;
-        self.refresh_tools().await?;
+        self.send_initialized(auth_token).await?;
+        self.refresh_tools(auth_token).await?;
         Ok(())
     }
 
-    async fn send_initialized(&self) -> Result<()> {
+    async fn send_initialized(&self, auth_token: Option<&str>) -> Result<()> {
         let notification = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: None,
@@ -123,6 +122,7 @@ impl DownstreamClient {
         if let Some(sid) = self.session_id.read().await.as_ref() {
             builder = builder.header("mcp-session-id", sid.clone());
         }
+        builder = self.add_auth(builder, auth_token);
 
         let resp = builder
             .send()
@@ -139,7 +139,7 @@ impl DownstreamClient {
         Ok(())
     }
 
-    async fn refresh_tools(&self) -> Result<()> {
+    async fn refresh_tools(&self, auth_token: Option<&str>) -> Result<()> {
         let mut all_tools: Vec<Tool> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
@@ -171,6 +171,7 @@ impl DownstreamClient {
             if let Some(sid) = self.session_id.read().await.as_ref() {
                 builder = builder.header("mcp-session-id", sid.clone());
             }
+            builder = self.add_auth(builder, auth_token);
 
             let resp = builder
                 .send()
@@ -238,7 +239,12 @@ impl DownstreamClient {
         self.session_id.read().await.clone()
     }
 
-    pub async fn call_tool(&self, name: &str, arguments: Option<Value>) -> Result<JsonRpcOutcome> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        auth_token: Option<&str>,
+    ) -> Result<JsonRpcOutcome> {
         let params = ToolCallParams {
             name: name.to_string(),
             arguments,
@@ -258,6 +264,7 @@ impl DownstreamClient {
         if let Some(sid) = self.session_id.read().await.as_ref() {
             builder = builder.header("mcp-session-id", sid.clone());
         }
+        builder = self.add_auth(builder, auth_token);
 
         let resp = builder
             .send()
@@ -277,5 +284,13 @@ impl DownstreamClient {
         }
         serde_json::from_slice::<JsonRpcOutcome>(&body)
             .context("downstream tools/call response parse failed")
+    }
+
+    fn add_auth(&self, builder: reqwest::RequestBuilder, auth_token: Option<&str>) -> reqwest::RequestBuilder {
+        if let Some(token) = auth_token {
+            builder.header("authorization", format!("Bearer {token}"))
+        } else {
+            builder
+        }
     }
 }

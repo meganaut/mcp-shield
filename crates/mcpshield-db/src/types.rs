@@ -1,5 +1,29 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone)]
+pub struct Integration {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub mcp_url: String,
+    pub oauth_auth_url: Option<String>,
+    pub oauth_token_url: Option<String>,
+    pub oauth_client_id: Option<String>,
+    pub oauth_scopes: Option<Vec<String>>,
+    pub connected: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VaultToken {
+    pub id: String,
+    pub integration_id: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthClient {
     pub client_id: String,
@@ -43,6 +67,7 @@ pub struct PolicyRule {
 pub struct TokenLookup {
     pub agent_id: String,
     pub client_id: String,
+    pub expires_at: i64,
 }
 
 /// Projection returned when authenticating a client at the token endpoint.
