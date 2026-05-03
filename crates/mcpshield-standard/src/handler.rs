@@ -30,6 +30,11 @@ use crate::session::{create_session, get_session, SessionStore};
 
 /// Maximum length for an Mcp-Session-Id header value. UUIDv4 is 36 chars; 128 is generous.
 const MAX_SESSION_ID_BYTES: usize = 128;
+/// Pending OAuth flows (inbound and outbound) expire after 10 minutes.
+pub const PENDING_AUTH_TTL_SECS: i64 = 600;
+pub const PENDING_INTEGRATION_TTL_SECS: i64 = 600;
+/// Maximum concurrent pending outbound integration auth flows.
+pub const MAX_PENDING_INTEGRATION_ENTRIES: usize = 100;
 
 /// A pending authorization request stored in-memory until user submits credentials.
 #[derive(Debug, Clone)]
@@ -295,7 +300,7 @@ pub async fn authenticate_bearer(
     // DB fallback
     match state.db.get_token_by_hash(&token_hash, now).await {
         Ok(Some(lookup)) => {
-            let cache_ttl = std::cmp::min(now + 60, lookup.expires_at);
+            let cache_ttl = std::cmp::min(now + 30, lookup.expires_at);
             state.bearer_cache.insert(
                 token_hash,
                 (lookup.agent_id.clone(), lookup.client_id.clone(), cache_ttl),
@@ -815,8 +820,8 @@ async fn get_vault_token_cached(state: &Arc<AppState>, integration_id: &str) -> 
     // Check cache
     if let Some(entry) = state.vault_cache.get(integration_id) {
         let (data, cached_at) = entry.value().clone();
-        // Evict if cached more than 5 minutes ago, or if token itself is expired
-        if cached_at.elapsed().as_secs() < 300 {
+        // Evict if cached more than 5 seconds ago, or if token itself is expired
+        if cached_at.elapsed().as_secs() < 5 {
             if let Some(expires_at) = data.expires_at {
                 if now < expires_at {
                     return data.access_token;

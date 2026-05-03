@@ -7,6 +7,8 @@ use std::sync::Arc;
 const MAX_PASSWORD_BYTES: usize = 1024;
 /// Reasonable cap to prevent oversized admin path parameters
 const MAX_TOOL_NAME_BYTES: usize = 256;
+/// Cap for outbound token endpoint responses — token responses are always tiny
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::extract::{Path, Query, State};
@@ -21,7 +23,17 @@ use uuid::Uuid;
 
 use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
-use crate::handler::{extract_client_ip, AppState, PeerIp};
+use crate::handler::{
+    extract_client_ip, AppState, PeerIp, MAX_PENDING_INTEGRATION_ENTRIES,
+    PENDING_INTEGRATION_TTL_SECS,
+};
+
+fn outbound_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
 
 /// Verify admin Basic auth. Returns Ok(()) or an error Response.
 pub async fn require_admin(
@@ -170,7 +182,10 @@ pub async fn delete_agent(
     }
 
     match state.db.delete_oauth_client(&agent_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            state.bearer_cache.retain(|_, (aid, _, _)| aid.as_str() != agent_id.as_str());
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(err = %e, "admin: db error deleting agent");
@@ -195,7 +210,10 @@ pub async fn revoke_agent_tokens(
     }
 
     match state.db.delete_agent_tokens(&agent_id).await {
-        Ok(count) => Json(serde_json::json!({ "revoked": count })).into_response(),
+        Ok(count) => {
+            state.bearer_cache.retain(|_, (aid, _, _)| aid.as_str() != agent_id.as_str());
+            Json(serde_json::json!({ "revoked": count })).into_response()
+        }
         Err(e) => {
             tracing::error!(err = %e, "admin: db error revoking tokens");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
@@ -576,7 +594,13 @@ pub async fn connect_client_credentials(
         }
     }
 
-    let http = reqwest::Client::new();
+    let http = match outbound_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(err = %e, "admin: failed to build http client");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
     let token_resp = match http
         .post(&token_url)
         .form(&form_params)
@@ -592,12 +616,21 @@ pub async fn connect_client_credentials(
 
     if !token_resp.status().is_success() {
         let status = token_resp.status();
-        let err_body = token_resp.text().await.unwrap_or_default();
-        tracing::warn!(status = %status, body = %err_body, "admin: client_credentials token endpoint returned error");
+        tracing::warn!(status = %status, "admin: client_credentials token endpoint returned error");
         return (StatusCode::BAD_GATEWAY, "token endpoint returned error").into_response();
     }
 
-    let token_json: serde_json::Value = match token_resp.json().await {
+    let body_bytes = match token_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(err = %e, "admin: failed to read token response");
+            return (StatusCode::BAD_GATEWAY, "token endpoint read failed").into_response();
+        }
+    };
+    if body_bytes.len() > MAX_TOKEN_RESPONSE_BYTES {
+        return (StatusCode::BAD_GATEWAY, "token response too large").into_response();
+    }
+    let token_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(err = %e, "admin: failed to parse token response");
@@ -686,6 +719,14 @@ pub async fn connect_authorize(
         format!("/oauth/integrations/{id}/callback")
     });
 
+    // H4: evict expired entries before inserting; reject if still at cap
+    if state.pending_integration_auth.len() >= MAX_PENDING_INTEGRATION_ENTRIES {
+        state.pending_integration_auth.retain(|_, v| now - v.created_at < PENDING_INTEGRATION_TTL_SECS);
+        if state.pending_integration_auth.len() >= MAX_PENDING_INTEGRATION_ENTRIES {
+            return (StatusCode::TOO_MANY_REQUESTS, "too many pending authorization flows").into_response();
+        }
+    }
+
     state.pending_integration_auth.insert(
         state_nonce.clone(),
         crate::handler::PendingIntegrationAuth {
@@ -696,17 +737,27 @@ pub async fn connect_authorize(
         },
     );
 
-    // Build the authorization URL
-    let mut url = format!(
-        "{auth_url}?response_type=code&client_id={client_id}&state={state_nonce}&code_challenge={code_challenge}&code_challenge_method=S256&redirect_uri={redirect_uri}"
-    );
-    if let Some(scopes) = &integration.oauth_scopes {
-        if !scopes.is_empty() {
-            url.push_str(&format!("&scope={}", scopes.join("%20")));
+    // H2: build URL with proper percent-encoding so injected & in any value can't add parameters
+    let mut parsed = match reqwest::Url::parse(&auth_url) {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid oauth_auth_url").into_response(),
+    };
+    {
+        let mut pairs = parsed.query_pairs_mut();
+        pairs.append_pair("response_type", "code");
+        pairs.append_pair("client_id", &client_id);
+        pairs.append_pair("state", &state_nonce);
+        pairs.append_pair("code_challenge", &code_challenge);
+        pairs.append_pair("code_challenge_method", "S256");
+        pairs.append_pair("redirect_uri", &redirect_uri);
+        if let Some(scopes) = &integration.oauth_scopes {
+            if !scopes.is_empty() {
+                pairs.append_pair("scope", &scopes.join(" "));
+            }
         }
     }
 
-    Json(serde_json::json!({ "url": url })).into_response()
+    Json(serde_json::json!({ "url": parsed.to_string() })).into_response()
 }
 
 // GET /oauth/integrations/{id}/callback — receive auth code callback
@@ -718,7 +769,13 @@ pub async fn integration_oauth_callback(
     let code = match params.get("code") {
         Some(c) => c.clone(),
         None => {
-            let error = params.get("error").map(|s| s.as_str()).unwrap_or("unknown");
+            // Restrict to known OAuth error codes — never reflect arbitrary query param values
+            let error = match params.get("error").map(|s| s.as_str()) {
+                Some("access_denied") => "access_denied",
+                Some("temporarily_unavailable") => "temporarily_unavailable",
+                Some("server_error") => "server_error",
+                _ => "authorization_failed",
+            };
             return (StatusCode::BAD_REQUEST, format!("authorization denied: {error}")).into_response();
         }
     };
@@ -757,7 +814,13 @@ pub async fn integration_oauth_callback(
     };
 
     // Exchange code for tokens
-    let http = reqwest::Client::new();
+    let http = match outbound_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(err = %e, "callback: failed to build http client");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
     let token_resp = match http
         .post(&token_url)
         .form(&[
@@ -780,7 +843,17 @@ pub async fn integration_oauth_callback(
         return (StatusCode::BAD_GATEWAY, "token endpoint returned error").into_response();
     }
 
-    let token_json: serde_json::Value = match token_resp.json().await {
+    let body_bytes = match token_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(err = %e, "callback: failed to read token response");
+            return (StatusCode::BAD_GATEWAY, "token endpoint read failed").into_response();
+        }
+    };
+    if body_bytes.len() > MAX_TOKEN_RESPONSE_BYTES {
+        return (StatusCode::BAD_GATEWAY, "token response too large").into_response();
+    }
+    let token_json: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(err = %e, "callback: failed to parse token response");

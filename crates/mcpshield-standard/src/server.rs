@@ -19,7 +19,8 @@ use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
 use crate::handler::{
     mcp_handler_authenticated, new_pending_store, new_pending_integration_auth_store,
-    new_rate_limiter, new_setup_csrf_token, AppState,
+    new_rate_limiter, new_setup_csrf_token, AppState, PENDING_AUTH_TTL_SECS,
+    PENDING_INTEGRATION_TTL_SECS,
 };
 use crate::oauth::authorize::{get_authorize, post_authorize};
 use crate::oauth::dcr::post_register;
@@ -154,16 +155,25 @@ pub async fn run(config: Config) -> Result<()> {
         vault_cache: Arc::new(DashMap::new()),
     });
 
-    let cleanup_db = Arc::clone(&db);
+    let cleanup_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
             let now = unix_timestamp_secs();
-            if let Err(e) = cleanup_db.delete_expired_access_tokens(now).await {
+
+            // DB — expire tokens and auth codes
+            if let Err(e) = cleanup_state.db.delete_expired_access_tokens(now).await {
                 tracing::warn!(err = %e, "cleanup: failed to delete expired access_tokens");
             }
-            if let Err(e) = cleanup_db.delete_expired_auth_codes(now).await {
+            if let Err(e) = cleanup_state.db.delete_expired_auth_codes(now).await {
                 tracing::warn!(err = %e, "cleanup: failed to delete expired auth_codes");
             }
+
+            // In-memory caches — evict stale entries so memory stays bounded
+            cleanup_state.bearer_cache.retain(|_, (_, _, expiry)| now < *expiry);
+            cleanup_state.vault_cache.retain(|_, (_, cached_at)| cached_at.elapsed().as_secs() < 5);
+            cleanup_state.pending_auth.retain(|_, v| now - v.created_at < PENDING_AUTH_TTL_SECS);
+            cleanup_state.pending_integration_auth.retain(|_, v| now - v.created_at < PENDING_INTEGRATION_TTL_SECS);
+
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
