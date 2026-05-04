@@ -11,7 +11,7 @@ use mcpcondor_policy_db::DbPolicyEngine;
 use mcpcondor_standard::admin::{delete_policy, get_policy, list_agents, set_policy};
 use mcpcondor_standard::downstream::DownstreamClient;
 use mcpcondor_standard::handler::{
-    mcp_handler_authenticated, new_pending_store, new_pending_integration_auth_store,
+    mcp_handler_authenticated, new_admin_session_key, new_pending_store, new_pending_integration_auth_store,
     new_rate_limiter, new_setup_csrf_token, AppState,
 };
 use std::net::SocketAddr;
@@ -102,6 +102,7 @@ async fn start_gateway(tools: Vec<Tool>) -> (String, Arc<dyn Store>) {
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        admin_session_key: new_admin_session_key(),
         bearer_cache: Arc::new(DashMap::new()),
         vault_cache: Arc::new(DashMap::new()),
     });

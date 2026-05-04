@@ -1320,6 +1320,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "askama",
  "axum",
  "base64",
  "chrono",
@@ -1333,6 +1334,7 @@ dependencies = [
  "mcpcondor-db-sqlite",
  "mcpcondor-policy-db",
  "mcpcondor-test-support",
+ "mcpcondor-ui",
  "rand 0.8.6",
  "rcgen",
  "reqwest",

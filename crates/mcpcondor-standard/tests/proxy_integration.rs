@@ -9,7 +9,7 @@ use mcpcondor_core::mcp::{
 };
 use mcpcondor_db::Store;
 use mcpcondor_standard::handler::{
-    mcp_handler_no_auth, new_pending_store, new_pending_integration_auth_store,
+    mcp_handler_no_auth, new_admin_session_key, new_pending_store, new_pending_integration_auth_store,
     new_rate_limiter, new_setup_csrf_token, AppState,
 };
 use mcpcondor_standard::noop::NoopAudit;
@@ -73,6 +73,7 @@ async fn start_proxy(mock_url: String, slug: &str) -> (String, Arc<AppState>) {
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        admin_session_key: new_admin_session_key(),
         bearer_cache: Arc::new(DashMap::new()),
         vault_cache: Arc::new(DashMap::new()),
     });

@@ -1,0 +1,6 @@
+target/
+data/
+.git/
+tmp/
+*.png
+docker-compose.override.yml

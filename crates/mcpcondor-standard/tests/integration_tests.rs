@@ -10,7 +10,7 @@ use mcpcondor_db_sqlite::SqliteStore;
 use mcpcondor_policy_db::DbPolicyEngine;
 use mcpcondor_standard::downstream::DownstreamClient;
 use mcpcondor_standard::handler::{
-    mcp_handler_no_auth, new_pending_store, new_pending_integration_auth_store,
+    mcp_handler_no_auth, new_admin_session_key, new_pending_store, new_pending_integration_auth_store,
     new_rate_limiter, new_setup_csrf_token, AppState,
 };
 use mcpcondor_standard::noop::NoopAudit;
@@ -144,6 +144,7 @@ async fn test_multi_integration_routing() {
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        admin_session_key: new_admin_session_key(),
         bearer_cache: Arc::new(DashMap::new()),
         vault_cache: Arc::new(DashMap::new()),
     });
@@ -275,6 +276,7 @@ async fn test_policy_namespaced_isolation() {
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        admin_session_key: new_admin_session_key(),
         bearer_cache: Arc::new(DashMap::new()),
         vault_cache: Arc::new(DashMap::new()),
     });
@@ -363,6 +365,7 @@ async fn test_vault_round_trip() {
         oauth_client_id: None,
         oauth_scopes: None,
         connected: false,
+        default_stance: false,
         created_at: 0,
     })
     .await

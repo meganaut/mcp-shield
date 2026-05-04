@@ -65,7 +65,7 @@
       <div class="flex items-center gap-3">
         <code class="text-xs bg-base-200 px-2 py-0.5 rounded font-bold text-base-content/70">{{ g.integration_slug }}</code>
         <span class="font-semibold">{{ g.integration_name }}</span>
-        <span class="text-sm text-base-content/50">{{ g.allowed_count }}/{{ g.tool_count }} allowed</span>
+        <span class="text-sm text-base-content/50 allowed-count" data-total="{{ g.tool_count }}">{{ g.allowed_count }}/{{ g.tool_count }} allowed</span>
       </div>
       <div class="flex gap-2">
         <button class="btn btn-xs btn-ghost" onclick="setAllInGroup('{{ g.integration_slug }}', false)">Deny all</button>
@@ -85,6 +85,7 @@
               <input type="checkbox" class="toggle toggle-success toggle-sm cursor-not-allowed" checked disabled title="Allowed by a global rule — always available regardless of profile">
               {% else %}
               <input type="checkbox" class="toggle toggle-success toggle-sm tool-toggle"
+                     data-tool="{{ t.full_name }}"
                      data-integration="{{ g.integration_slug }}"
                      {% if t.allowed %}checked{% endif %}
                      onchange="onToolToggle(this)">
@@ -99,12 +100,12 @@
                 {% else %}
                 <span class="badge badge-sm badge-ghost font-mono font-bold" style="min-width:3.2rem">?</span>
                 {% endif %}
-                <code class="text-xs font-medium text-base-content">{{ t.full_name }}</code>
+                <code class="text-xs font-medium text-base-content" title="{{ t.full_name }}">{{ t.local_name }}</code>
               </div>
             </td>
             <td class="text-sm text-base-content/60 max-w-lg">
               {% if let Some(desc) = t.description %}
-              <span class="line-clamp-1 cursor-pointer select-none" title="{{ desc }}" onclick="toggleDesc(this)">{{ desc }}</span>
+              <span class="desc-text line-clamp-1 cursor-pointer select-none" title="{{ desc }}" onclick="toggleDesc(this)">{{ desc }}</span>
               {% endif %}
             </td>
             <td class="text-right" style="min-width:8rem">
@@ -151,42 +152,68 @@
 </dialog>
 
 <script>
+var profileId = '{{ id }}';
+
+function saveRule(toolName, allowed) {
+  return fetch('/admin/profiles/' + profileId + '/rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'tool_name=' + encodeURIComponent(toolName) + '&allowed=' + (allowed ? '1' : '0')
+  });
+}
+
+function saveBulk(integrationSlug, allowed) {
+  return fetch('/admin/profiles/' + profileId + '/rules/bulk', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'integration_slug=' + encodeURIComponent(integrationSlug) + '&allowed=' + (allowed ? '1' : '0')
+  });
+}
+
+function updateBadge(cb) {
+  var badge = cb.closest('tr') && cb.closest('tr').querySelector('.tool-badge');
+  if (!badge) return;
+  badge.textContent = cb.checked ? 'allowed' : 'denied';
+  badge.className = cb.checked ? 'badge badge-success badge-sm tool-badge' : 'badge badge-ghost badge-sm tool-badge';
+}
+
+function onToolToggle(cb) {
+  updateBadge(cb);
+  if (window._bulkUpdate) return;
+  saveRule(cb.dataset.tool, cb.checked)
+    .then(function(r) { showToast(r.ok ? 'Saved' : 'Error — could not save', !r.ok); })
+    .catch(function() { showToast('Error — could not save', true); });
+}
+
+function setAllInGroup(slug, allow) {
+  var table = document.getElementById('table-' + slug);
+  if (!table) return;
+  window._bulkUpdate = true;
+  table.querySelectorAll('.tool-toggle').forEach(function(cb) {
+    cb.checked = allow;
+    updateBadge(cb);
+  });
+  window._bulkUpdate = false;
+  saveBulk(slug, allow)
+    .then(function(r) { showToast(r.ok ? 'Saved' : 'Error — could not save', !r.ok); })
+    .catch(function() { showToast('Error — could not save', true); });
+}
+
 function filterTools(query) {
   var q = query.toLowerCase();
   document.querySelectorAll('.tool-row').forEach(function(row) {
-    var name = row.dataset.tool || '';
-    var match = !q || name.toLowerCase().includes(q);
-    row.style.display = match ? '' : 'none';
+    var name = (row.dataset.tool || '').toLowerCase();
+    var desc = row.querySelector('.desc-text');
+    var descText = desc ? desc.textContent.toLowerCase() : '';
+    row.style.display = (!q || name.includes(q) || descText.includes(q)) ? '' : 'none';
   });
-  // Hide group cards where all rows are hidden
   document.querySelectorAll('[id^="group-"]').forEach(function(card) {
-    var slug = card.id.replace('group-', '');
     var rows = card.querySelectorAll('.tool-row');
     var anyVisible = Array.from(rows).some(function(r) { return r.style.display !== 'none'; });
     card.style.display = anyVisible ? '' : 'none';
   });
 }
 
-function onToolToggle(cb) {
-  var row = cb.closest('tr');
-  var badge = row.querySelector('.tool-badge');
-  if (cb.checked) {
-    badge.textContent = 'allowed';
-    badge.className = 'badge badge-success badge-sm tool-badge';
-  } else {
-    badge.textContent = 'denied';
-    badge.className = 'badge badge-ghost badge-sm tool-badge';
-  }
-}
-
-function setAllInGroup(slug, allow) {
-  var table = document.getElementById('table-' + slug);
-  if (!table) return;
-  table.querySelectorAll('.tool-toggle').forEach(function(cb) {
-    cb.checked = allow;
-    onToolToggle(cb);
-  });
-}
 function toggleDesc(el) {
   var clamped = el.classList.contains('line-clamp-1');
   el.classList.toggle('line-clamp-1', !clamped);

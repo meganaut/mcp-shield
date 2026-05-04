@@ -11,6 +11,7 @@ pub struct Integration {
     pub oauth_client_id: Option<String>,
     pub oauth_scopes: Option<Vec<String>>,
     pub connected: bool,
+    pub default_stance: bool,
     pub created_at: i64,
 }
 
@@ -31,6 +32,7 @@ pub struct OAuthClient {
     pub client_secret_hash: String,
     pub client_name: String,
     pub redirect_uris: Vec<String>,
+    pub profile_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -59,6 +61,46 @@ pub struct PolicyRule {
     pub agent_id: String,
     pub tool_name: String,
     pub allowed: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_default: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileRule {
+    pub profile_id: String,
+    pub tool_name: String,
+    pub allowed: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalRule {
+    pub tool_name: String,
+    pub allowed: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AgentOverrideKind {
+    Static,
+    Until { expires_at: i64 },
+    Uses { remaining: i64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentOverride {
+    pub agent_id: String,
+    pub tool_name: String,
+    pub allowed: bool,
+    pub kind: AgentOverrideKind,
     pub created_at: i64,
 }
 
@@ -93,4 +135,9 @@ pub struct AuditEventRow {
     pub operation_name: String,
     pub outcome: String,
     pub latency_ms: i64,
+    pub integration_slug: Option<String>,
+    pub deny_reason: Option<String>,
+    pub error_message: Option<String>,
+    pub client_id: Option<String>,
+    pub dlp_detections: Option<String>,
 }

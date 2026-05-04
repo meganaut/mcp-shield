@@ -1,0 +1,15 @@
+services:
+  mcpcondor:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - mcpcondor-data:/data
+      - ./docker/mcpcondor.toml:/etc/mcpcondor.toml:ro
+    environment:
+      MCPSHIELD_CONFIG: /etc/mcpcondor.toml
+      RUST_LOG: info
+    restart: unless-stopped
+
+volumes:
+  mcpcondor-data:

@@ -114,6 +114,7 @@ pub async fn post_register(
             client_secret_hash: secret_hash.clone(),
             client_name: req.client_name.clone(),
             redirect_uris: req.redirect_uris.clone(),
+            profile_id: None,
             created_at: now,
         })
         .await

@@ -99,7 +99,7 @@
   <div class="btm-nav btm-nav-sm md:hidden z-50">
     <a href="/ui" class="{% block mob_dashboard %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg></a>
     <a href="/ui/integrations" class="{% block mob_integrations %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg></a>
-    <a href="/ui/agents" class="{% block mob_agents %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17H3a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2h-2"/></svg></a>
+    <a href="/ui/agents" class="{% block mob_agents %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v3M5 7a2 2 0 012-2h10a2 2 0 012 2v10a2 2 0 01-2 2H7a2 2 0 01-2-2V7zM9 15.5h6"/><circle cx="9.5" cy="11.5" r="1.5" stroke-width="2"/><circle cx="14.5" cy="11.5" r="1.5" stroke-width="2"/></svg></a>
     <a href="/ui/audit" class="{% block mob_audit %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg></a>
   </div>
 
@@ -108,8 +108,24 @@
     {% block content %}{% endblock %}
   </main>
 
+  <!-- Toast container -->
+  <div id="toast-container" class="toast toast-end toast-bottom z-50" style="pointer-events:none"></div>
+
   <script src="/assets/htmx.min.js"></script>
   <script>
+    function showToast(msg, isError) {
+      var c = document.getElementById('toast-container');
+      var el = document.createElement('div');
+      el.className = 'alert text-sm py-2 px-4 gap-2 ' + (isError ? 'alert-error' : 'alert-success');
+      el.style.pointerEvents = 'auto';
+      el.textContent = msg;
+      c.appendChild(el);
+      setTimeout(function() {
+        el.style.transition = 'opacity 0.4s';
+        el.style.opacity = '0';
+        setTimeout(function() { if (c.contains(el)) c.removeChild(el); }, 400);
+      }, 1500);
+    }
     function syncThemeUI() {
       var isDark = document.getElementById('html-root').getAttribute('data-theme') === 'dark';
       document.getElementById('theme-icon-dark').classList.toggle('hidden', !isDark);

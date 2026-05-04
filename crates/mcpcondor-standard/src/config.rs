@@ -6,11 +6,15 @@ pub struct Config {
     pub server: ServerConfig,
 }
 
+fn default_audit_retention_days() -> u32 { 90 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub listen_addr: String,
     pub port: u16,
     pub data_dir: PathBuf,
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
 }
 
 impl Default for Config {
@@ -20,6 +24,7 @@ impl Default for Config {
                 listen_addr: "127.0.0.1".to_string(),
                 port: 8443,
                 data_dir: PathBuf::from("data"),
+                audit_retention_days: default_audit_retention_days(),
             },
         }
     }

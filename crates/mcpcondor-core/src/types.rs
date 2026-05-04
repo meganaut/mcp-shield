@@ -39,6 +39,8 @@ pub struct AuditEvent {
     pub outcome: AuditOutcome,
     pub dlp_detections: Vec<Detection>,
     pub latency_ms: u64,
+    /// OAuth client_id of the agent that made this call (None for no-auth mode).
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

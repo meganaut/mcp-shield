@@ -67,6 +67,13 @@ pub trait Store: Send + Sync {
         agent_id: &str,
         limit: i64,
     ) -> Result<Vec<AuditEventRow>, StoreError>;
+    /// Delete audit events older than the given timestamp (milliseconds since epoch).
+    /// Returns the number of rows deleted.
+    async fn delete_old_audit_events(&self, before_ms: i64) -> Result<u64, StoreError>;
+    /// List the most recent audit events across all agents.
+    async fn list_all_audit_events(&self, limit: i64) -> Result<Vec<AuditEventRow>, StoreError>;
+    /// Count tool calls since a timestamp (ms). Returns (total, denied).
+    async fn count_audit_events_since(&self, since_ms: i64) -> Result<(u64, u64), StoreError>;
 
     // --- Integrations ---
     async fn insert_integration(&self, integration: &Integration) -> Result<(), StoreError>;
@@ -95,4 +102,42 @@ pub trait Store: Send + Sync {
         agent_id: &str,
         tool_name: &str,
     ) -> Result<Option<PolicyRule>, StoreError>;
+
+    // --- Profiles ---
+    async fn insert_profile(&self, profile: &Profile) -> Result<(), StoreError>;
+    async fn get_profile(&self, id: &str) -> Result<Option<Profile>, StoreError>;
+    async fn list_profiles(&self) -> Result<Vec<Profile>, StoreError>;
+    async fn update_profile(&self, id: &str, name: &str, description: Option<&str>) -> Result<(), StoreError>;
+    async fn delete_profile(&self, id: &str) -> Result<bool, StoreError>;
+
+    // --- Profile rules ---
+    async fn upsert_profile_rule(&self, rule: &ProfileRule) -> Result<(), StoreError>;
+    async fn delete_profile_rule(&self, profile_id: &str, tool_name: &str) -> Result<bool, StoreError>;
+    async fn list_profile_rules(&self, profile_id: &str) -> Result<Vec<ProfileRule>, StoreError>;
+    async fn get_profile_rule(&self, profile_id: &str, tool_name: &str) -> Result<Option<ProfileRule>, StoreError>;
+    /// Set all rules for tools matching an integration slug prefix (slug__) to the given allowed value.
+    /// Upserts one row per tool_name provided.
+    async fn set_profile_rules_for_integration(
+        &self,
+        profile_id: &str,
+        tool_names: &[String],
+        allowed: bool,
+        now: i64,
+    ) -> Result<(), StoreError>;
+
+    // --- Global rules ---
+    async fn upsert_global_rule(&self, rule: &GlobalRule) -> Result<(), StoreError>;
+    async fn delete_global_rule(&self, tool_name: &str) -> Result<bool, StoreError>;
+    async fn list_global_rules(&self) -> Result<Vec<GlobalRule>, StoreError>;
+    async fn get_global_rule(&self, tool_name: &str) -> Result<Option<GlobalRule>, StoreError>;
+
+    // --- Agent overrides ---
+    async fn upsert_agent_override(&self, override_: &AgentOverride) -> Result<(), StoreError>;
+    async fn delete_agent_override(&self, agent_id: &str, tool_name: &str) -> Result<bool, StoreError>;
+    async fn list_agent_overrides(&self, agent_id: &str) -> Result<Vec<AgentOverride>, StoreError>;
+    async fn get_agent_override(&self, agent_id: &str, tool_name: &str) -> Result<Option<AgentOverride>, StoreError>;
+
+    // --- Profile assignment ---
+    async fn set_agent_profile(&self, agent_id: &str, profile_id: Option<&str>) -> Result<(), StoreError>;
+    async fn get_agent_profile_id(&self, agent_id: &str) -> Result<Option<String>, StoreError>;
 }

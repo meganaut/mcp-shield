@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use mcpcondor_core::vault::VaultTokenData;
-use mcpcondor_db::{Integration, PolicyRule};
+use mcpcondor_db::{AgentOverride, AgentOverrideKind, GlobalRule, Integration, Profile, ProfileRule};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -236,15 +236,15 @@ pub async fn get_policy(
         return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
     }
 
-    let rules = match state.db.list_policy_rules(&agent_id).await {
+    let overrides = match state.db.list_agent_overrides(&agent_id).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(err = %e, "admin: db error listing policy rules");
+            tracing::error!(err = %e, "admin: db error listing agent overrides");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     };
 
-    let rules: Vec<serde_json::Value> = rules
+    let rules: Vec<serde_json::Value> = overrides
         .into_iter()
         .map(|r| {
             serde_json::json!({
@@ -287,10 +287,11 @@ pub async fn set_policy(
     let now = unix_timestamp_secs();
     match state
         .db
-        .upsert_policy_rule(&PolicyRule {
+        .upsert_agent_override(&AgentOverride {
             agent_id: agent_id.clone(),
             tool_name: body.tool_name.clone(),
             allowed: body.allowed,
+            kind: AgentOverrideKind::Static,
             created_at: now,
         })
         .await
@@ -322,11 +323,465 @@ pub async fn delete_policy(
         return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
     }
 
-    match state.db.delete_policy_rule(&agent_id, &tool_name).await {
+    match state.db.delete_agent_override(&agent_id, &tool_name).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(err = %e, "admin: db error deleting policy");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// ─── Profile Admin Handlers ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CreateProfileBody {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SetRuleBody {
+    pub tool_name: String,
+    pub allowed: bool,
+}
+
+#[derive(Deserialize)]
+pub struct BulkRuleBody {
+    pub integration_slug: String,
+    pub allowed: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetGlobalRuleBody {
+    pub tool_name: String,
+    pub allowed: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetOverrideBody {
+    pub tool_name: String,
+    pub allowed: bool,
+    pub kind: String,
+    pub expires_at: Option<i64>,
+    pub remaining: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct AssignProfileBody {
+    pub profile_id: String,
+}
+
+// GET /admin/profiles
+pub async fn list_profiles(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.list_profiles().await {
+        Ok(profiles) => Json(profiles).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error listing profiles");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/profiles
+pub async fn create_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Json(body): Json<CreateProfileBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if body.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name must not be empty").into_response();
+    }
+    let id = Uuid::new_v4().to_string();
+    let now = unix_timestamp_secs();
+    let profile = Profile {
+        id: id.clone(),
+        name: body.name,
+        description: body.description,
+        is_default: false,
+        created_at: now,
+    };
+    match state.db.insert_profile(&profile).await {
+        Ok(()) => (StatusCode::CREATED, Json(profile)).into_response(),
+        Err(mcpcondor_db::StoreError::Conflict(_)) => {
+            (StatusCode::CONFLICT, "profile name already exists").into_response()
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error creating profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// GET /admin/profiles/{id}
+pub async fn get_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.get_profile(&id).await {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error getting profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// PUT /admin/profiles/{id}
+pub async fn update_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+    Json(body): Json<CreateProfileBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if body.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name must not be empty").into_response();
+    }
+    match state.db.update_profile(&id, &body.name, body.description.as_deref()).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error updating profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// DELETE /admin/profiles/{id}
+pub async fn delete_profile_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    // Check if it's the default profile
+    match state.db.get_profile(&id).await {
+        Ok(Some(p)) if p.is_default => {
+            return (StatusCode::BAD_REQUEST, "cannot delete the default profile").into_response();
+        }
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error looking up profile");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
+        }
+        _ => {}
+    }
+    match state.db.delete_profile(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/profiles/{id}/rules
+pub async fn set_profile_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+    Json(body): Json<SetRuleBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if body.tool_name.is_empty() || body.tool_name.len() > MAX_TOOL_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
+    }
+    let now = unix_timestamp_secs();
+    let rule = ProfileRule {
+        profile_id: id,
+        tool_name: body.tool_name,
+        allowed: body.allowed,
+        created_at: now,
+    };
+    match state.db.upsert_profile_rule(&rule).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error setting profile rule");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// DELETE /admin/profiles/{id}/rules/{tool_name}
+pub async fn delete_profile_rule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path((id, tool_name)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.delete_profile_rule(&id, &tool_name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting profile rule");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// GET /admin/profiles/{id}/rules
+pub async fn list_profile_rules_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.list_profile_rules(&id).await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error listing profile rules");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/profiles/{id}/rules/bulk
+pub async fn set_profile_rules_bulk(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(id): Path<String>,
+    Json(body): Json<BulkRuleBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    let slug = &body.integration_slug;
+    let downstream = match state.downstreams.get(slug) {
+        Some(d) => d.clone(),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let tools = downstream.list_tools().await;
+    if tools.is_empty() {
+        return (StatusCode::NOT_FOUND, "integration has no tools (not yet initialized)").into_response();
+    }
+    let tool_names: Vec<String> = tools
+        .iter()
+        .map(|t| format!("{}__{}", slug, t.name))
+        .collect();
+    let now = unix_timestamp_secs();
+    match state.db.set_profile_rules_for_integration(&id, &tool_names, body.allowed, now).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error setting bulk profile rules");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// ─── Global Rules Handlers ─────────────────────────────────────────────────────
+
+// GET /admin/global-rules
+pub async fn list_global_rules_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.list_global_rules().await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error listing global rules");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/global-rules
+pub async fn set_global_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Json(body): Json<SetGlobalRuleBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if body.tool_name.is_empty() || body.tool_name.len() > MAX_TOOL_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
+    }
+    let now = unix_timestamp_secs();
+    let rule = GlobalRule {
+        tool_name: body.tool_name,
+        allowed: body.allowed,
+        created_at: now,
+    };
+    match state.db.upsert_global_rule(&rule).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error setting global rule");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// DELETE /admin/global-rules/{tool_name}
+pub async fn delete_global_rule_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(tool_name): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    match state.db.delete_global_rule(&tool_name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting global rule");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// ─── Agent Override Handlers ───────────────────────────────────────────────────
+
+// GET /admin/agents/{agent_id}/overrides
+pub async fn list_agent_overrides_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(agent_id): Path<String>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+    match state.db.list_agent_overrides(&agent_id).await {
+        Ok(overrides) => Json(overrides).into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error listing agent overrides");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/agents/{agent_id}/overrides
+pub async fn set_agent_override(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(agent_id): Path<String>,
+    Json(body): Json<SetOverrideBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+    if body.tool_name.is_empty() || body.tool_name.len() > MAX_TOOL_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "tool_name must be 1–256 characters").into_response();
+    }
+    let kind = match body.kind.as_str() {
+        "static" => AgentOverrideKind::Static,
+        "until" => match body.expires_at {
+            Some(ea) => AgentOverrideKind::Until { expires_at: ea },
+            None => return (StatusCode::BAD_REQUEST, "expires_at required for kind=until").into_response(),
+        },
+        "uses" => match body.remaining {
+            Some(r) => AgentOverrideKind::Uses { remaining: r },
+            None => return (StatusCode::BAD_REQUEST, "remaining required for kind=uses").into_response(),
+        },
+        _ => return (StatusCode::BAD_REQUEST, "kind must be 'static', 'until', or 'uses'").into_response(),
+    };
+    let now = unix_timestamp_secs();
+    let override_ = AgentOverride {
+        agent_id: agent_id.clone(),
+        tool_name: body.tool_name,
+        allowed: body.allowed,
+        kind,
+        created_at: now,
+    };
+    match state.db.upsert_agent_override(&override_).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error setting agent override");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// DELETE /admin/agents/{agent_id}/overrides/{tool_name}
+pub async fn delete_agent_override_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path((agent_id, tool_name)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+    match state.db.delete_agent_override(&agent_id, &tool_name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error deleting agent override");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// POST /admin/agents/{agent_id}/profile
+pub async fn assign_agent_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    PeerIp(peer_ip): PeerIp,
+    Path(agent_id): Path<String>,
+    Json(body): Json<AssignProfileBody>,
+) -> Response {
+    if let Err(e) = require_admin(&state, &headers, peer_ip).await {
+        return e;
+    }
+    if Uuid::parse_str(&agent_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "agent_id must be a UUID").into_response();
+    }
+    match state.db.set_agent_profile(&agent_id, Some(&body.profile_id)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(err = %e, "admin: db error assigning agent profile");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
@@ -422,6 +877,7 @@ pub async fn create_integration(
         oauth_client_id: body.oauth_client_id.clone(),
         oauth_scopes: body.oauth_scopes.clone(),
         connected: false,
+        default_stance: false,
         created_at: now,
     };
 

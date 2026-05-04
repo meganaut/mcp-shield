@@ -9,18 +9,28 @@ use dashmap::DashMap;
 use tokio::net::TcpListener;
 
 use crate::admin::{
-    connect_authorize, connect_client_credentials, create_integration, delete_agent,
-    delete_integration_handler, delete_policy, get_policy, integration_oauth_callback,
-    list_agents, list_integrations, refresh_integration, revoke_agent_tokens, set_policy,
+    assign_agent_profile, connect_authorize, connect_client_credentials, create_integration,
+    create_profile, delete_agent, delete_agent_override_handler, delete_global_rule_handler,
+    delete_integration_handler, delete_policy, delete_profile_handler, delete_profile_rule_handler,
+    get_policy, get_profile, integration_oauth_callback, list_agent_overrides_handler,
+    list_agents, list_global_rules_handler, list_integrations, list_profile_rules_handler,
+    list_profiles, refresh_integration, revoke_agent_tokens, set_agent_override, set_global_rule,
+    set_policy, set_profile_rule, set_profile_rules_bulk, update_profile,
 };
 use crate::audit::DbAuditSink;
 use crate::config::Config;
 use crate::crypto::unix_timestamp_secs;
 use crate::downstream::DownstreamClient;
 use crate::handler::{
-    mcp_handler_authenticated, new_pending_store, new_pending_integration_auth_store,
-    new_rate_limiter, new_setup_csrf_token, AppState, PENDING_AUTH_TTL_SECS,
-    PENDING_INTEGRATION_TTL_SECS,
+    mcp_handler_authenticated, new_admin_session_key, new_pending_store,
+    new_pending_integration_auth_store, new_rate_limiter, new_setup_csrf_token, AppState,
+    PENDING_AUTH_TTL_SECS, PENDING_INTEGRATION_TTL_SECS,
+};
+use crate::ui::{
+    get_ui_agent_detail, get_ui_agents, get_ui_audit, get_ui_dashboard,
+    get_ui_integration_tools, get_ui_integrations, get_ui_login, get_ui_profile_detail,
+    get_ui_profiles, post_ui_create_profile, post_ui_login, post_ui_logout,
+    post_ui_rename_profile,
 };
 use crate::oauth::authorize::{get_authorize, post_authorize};
 use crate::oauth::dcr::post_register;
@@ -60,38 +70,10 @@ pub async fn run(config: Config) -> Result<()> {
     let addr = format!("{}:{}", config.server.listen_addr, config.server.port);
 
     if !db.is_setup_complete().await.context("check setup")? {
-        tracing::info!("Setup not complete — serving setup wizard on http://{addr}/setup");
-
-        let policy = Arc::new(CachingPolicyEngine::new(Arc::new(
-            DbPolicyEngine::new(Arc::clone(&db)),
-        )));
-
-        let state = Arc::new(AppState {
-            sessions: new_store(),
-            downstreams: Arc::new(DashMap::new()),
-            policy,
-            audit: Arc::new(DbAuditSink::new(Arc::clone(&db))),
-            db: Arc::clone(&db),
-            vault,
-            pending_auth: new_pending_store(),
-            pending_integration_auth: new_pending_integration_auth_store(),
-            rate_limiter: new_rate_limiter(),
-            admin_rate_limiter: new_rate_limiter(),
-            setup_csrf_token: new_setup_csrf_token(),
-            bearer_cache: Arc::new(DashMap::new()),
-            vault_cache: Arc::new(DashMap::new()),
-        });
-
-        let app = Router::new()
-            .route("/setup", get(get_setup).post(post_setup))
-            .route("/setup/done", get(get_setup_done))
-            .layer(DefaultBodyLimit::max(64 * 1024))
-            .with_state(state);
-
-        return run_plain(app, &addr).await;
+        tracing::info!("Setup not complete — visit http://{addr}/setup to configure MCPCondor");
     }
 
-    // Full gateway mode — load all integrations from DB
+    // Load all integrations from DB
     let downstreams: Arc<DashMap<String, Arc<DownstreamClient>>> = Arc::new(DashMap::new());
 
     let integrations = db.list_integrations().await.context("load integrations")?;
@@ -151,11 +133,13 @@ pub async fn run(config: Config) -> Result<()> {
         rate_limiter: new_rate_limiter(),
         admin_rate_limiter: new_rate_limiter(),
         setup_csrf_token: new_setup_csrf_token(),
+        admin_session_key: new_admin_session_key(),
         bearer_cache: Arc::new(DashMap::new()),
         vault_cache: Arc::new(DashMap::new()),
     });
 
     let cleanup_state = Arc::clone(&state);
+    let audit_retention_days = config.server.audit_retention_days;
     tokio::spawn(async move {
         loop {
             let now = unix_timestamp_secs();
@@ -166,6 +150,13 @@ pub async fn run(config: Config) -> Result<()> {
             }
             if let Err(e) = cleanup_state.db.delete_expired_auth_codes(now).await {
                 tracing::warn!(err = %e, "cleanup: failed to delete expired auth_codes");
+            }
+
+            // Audit retention — delete events older than configured retention window
+            let retention_ms = (audit_retention_days as i64) * 86_400 * 1_000;
+            let cutoff_ms = now * 1_000 - retention_ms;
+            if let Err(e) = cleanup_state.db.delete_old_audit_events(cutoff_ms).await {
+                tracing::warn!(err = %e, "cleanup: failed to delete old audit events");
             }
 
             // In-memory caches — evict stale entries so memory stays bounded
@@ -179,6 +170,26 @@ pub async fn run(config: Config) -> Result<()> {
     });
 
     let app = Router::new()
+        // Root redirect
+        .route("/", get(root_redirect))
+        // Setup wizard
+        .route("/setup", get(get_setup).post(post_setup))
+        .route("/setup/done", get(get_setup_done))
+        // Admin UI
+        .route("/ui", get(get_ui_dashboard))
+        .route("/ui/login", get(get_ui_login).post(post_ui_login))
+        .route("/ui/logout", post(post_ui_logout))
+        .route("/ui/integrations", get(get_ui_integrations))
+        .route("/ui/integrations/{id}/tools", get(get_ui_integration_tools))
+        .route("/ui/agents", get(get_ui_agents))
+        .route("/ui/agents/{id}", get(get_ui_agent_detail))
+        .route("/ui/profiles", get(get_ui_profiles).post(post_ui_create_profile))
+        .route("/ui/profiles/{id}", get(get_ui_profile_detail))
+        .route("/ui/profiles/{id}/rename", post(post_ui_rename_profile))
+        .route("/ui/audit", get(get_ui_audit))
+        // Static assets for the UI
+        .route("/assets/{*path}", get(ui_assets))
+        // MCP gateway
         .route("/mcp", post(mcp_handler_authenticated))
         .route("/.well-known/oauth-authorization-server", get(get_metadata))
         .route("/oauth/register", post(post_register))
@@ -190,6 +201,16 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/admin/agents/{agent_id}/tokens", delete(revoke_agent_tokens))
         .route("/admin/agents/{agent_id}/policy", get(get_policy).post(set_policy))
         .route("/admin/agents/{agent_id}/policy/{tool_name}", delete(delete_policy))
+        .route("/admin/agents/{agent_id}/overrides", get(list_agent_overrides_handler).post(set_agent_override))
+        .route("/admin/agents/{agent_id}/overrides/{tool_name}", delete(delete_agent_override_handler))
+        .route("/admin/agents/{agent_id}/profile", post(assign_agent_profile))
+        .route("/admin/profiles", get(list_profiles).post(create_profile))
+        .route("/admin/profiles/{id}", get(get_profile).put(update_profile).delete(delete_profile_handler))
+        .route("/admin/profiles/{id}/rules", get(list_profile_rules_handler).post(set_profile_rule))
+        .route("/admin/profiles/{id}/rules/bulk", post(set_profile_rules_bulk))
+        .route("/admin/profiles/{id}/rules/{tool_name}", delete(delete_profile_rule_handler))
+        .route("/admin/global-rules", get(list_global_rules_handler).post(set_global_rule))
+        .route("/admin/global-rules/{tool_name}", delete(delete_global_rule_handler))
         .route("/admin/integrations", get(list_integrations).post(create_integration))
         .route("/admin/integrations/{id}", delete(delete_integration_handler))
         .route("/admin/integrations/{id}/refresh", post(refresh_integration))
@@ -208,6 +229,37 @@ pub async fn run(config: Config) -> Result<()> {
     #[cfg(not(feature = "tls"))]
     {
         run_plain(app, addr_str).await
+    }
+}
+
+async fn ui_assets(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    match mcpcondor_ui::assets::StaticAssets::get(&path) {
+        Some(content) => {
+            let mime = match path.rsplit('.').next().unwrap_or("") {
+                "css" => "text/css",
+                "js" => "application/javascript",
+                "svg" => "image/svg+xml",
+                "png" => "image/png",
+                "ico" => "image/x-icon",
+                _ => "application/octet-stream",
+            };
+            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn root_redirect(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::{IntoResponse, Redirect};
+    match state.db.is_setup_complete().await {
+        Ok(true) => Redirect::to("/ui").into_response(),
+        _ => Redirect::to("/setup").into_response(),
     }
 }
 

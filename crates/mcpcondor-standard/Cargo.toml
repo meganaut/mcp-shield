@@ -12,6 +12,8 @@ mcpcondor-core = { path = "../mcpcondor-core" }
 mcpcondor-db = { path = "../mcpcondor-db" }
 mcpcondor-db-sqlite = { path = "../mcpcondor-db-sqlite" }
 mcpcondor-policy-db = { path = "../mcpcondor-policy-db" }
+mcpcondor-ui = { path = "../mcpcondor-ui" }
+askama = "0.12"
 axum = { version = "0.8", features = ["form"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

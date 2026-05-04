@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use mcpcondor_db::{
-    AccessToken, AuditEventRow, AuthCode, ClientAuthInfo, ClientAuthorizeInfo, Integration,
-    OAuthClient, PolicyRule, Store, StoreError, TokenLookup, VaultToken,
+    AccessToken, AgentOverride, AgentOverrideKind, AuditEventRow, AuthCode, ClientAuthInfo,
+    ClientAuthorizeInfo, GlobalRule, Integration, OAuthClient, PolicyRule, Profile, ProfileRule,
+    Store, StoreError, TokenLookup, VaultToken,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -105,14 +106,15 @@ impl Store for SqliteStore {
             serde_json::to_string(&client.redirect_uris).map_err(store_err)?;
         sqlx::query(
             "INSERT INTO oauth_clients \
-             (client_id, agent_id, client_secret_hash, client_name, redirect_uris, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (client_id, agent_id, client_secret_hash, client_name, redirect_uris, profile_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&client.client_id)
         .bind(&client.agent_id)
         .bind(&client.client_secret_hash)
         .bind(&client.client_name)
         .bind(&redirect_uris_json)
+        .bind(&client.profile_id)
         .bind(client.created_at)
         .execute(&self.pool)
         .await
@@ -173,15 +175,15 @@ impl Store for SqliteStore {
     }
 
     async fn list_oauth_clients(&self) -> Result<Vec<OAuthClient>, StoreError> {
-        let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
-            "SELECT client_id, agent_id, client_secret_hash, client_name, redirect_uris, created_at \
+        let rows: Vec<(String, String, String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT client_id, agent_id, client_secret_hash, client_name, redirect_uris, profile_id, created_at \
              FROM oauth_clients ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
         .map_err(store_err)?;
         rows.into_iter()
-            .map(|(client_id, agent_id, client_secret_hash, client_name, redirect_uris_json, created_at)| {
+            .map(|(client_id, agent_id, client_secret_hash, client_name, redirect_uris_json, profile_id, created_at)| {
                 let redirect_uris: Vec<String> =
                     serde_json::from_str(&redirect_uris_json).map_err(store_err)?;
                 Ok(OAuthClient {
@@ -190,6 +192,7 @@ impl Store for SqliteStore {
                     client_secret_hash,
                     client_name,
                     redirect_uris,
+                    profile_id,
                     created_at,
                 })
             })
@@ -223,7 +226,7 @@ impl Store for SqliteStore {
             .execute(&mut *tx)
             .await
             .map_err(store_err)?;
-        sqlx::query("DELETE FROM policy_rules WHERE agent_id = ?")
+        sqlx::query("DELETE FROM agent_overrides WHERE agent_id = ?")
             .bind(agent_id)
             .execute(&mut *tx)
             .await
@@ -320,8 +323,9 @@ impl Store for SqliteStore {
     async fn insert_audit_event(&self, event: &AuditEventRow) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO audit_events \
-             (id, timestamp_ms, agent_id, operation_name, outcome, latency_ms) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             (id, timestamp_ms, agent_id, operation_name, outcome, latency_ms, \
+              integration_slug, deny_reason, error_message, client_id, dlp_detections) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&event.id)
         .bind(event.timestamp_ms)
@@ -329,6 +333,11 @@ impl Store for SqliteStore {
         .bind(&event.operation_name)
         .bind(&event.outcome)
         .bind(event.latency_ms)
+        .bind(&event.integration_slug)
+        .bind(&event.deny_reason)
+        .bind(&event.error_message)
+        .bind(&event.client_id)
+        .bind(&event.dlp_detections)
         .execute(&self.pool)
         .await
         .map_err(store_err)?;
@@ -340,8 +349,10 @@ impl Store for SqliteStore {
         agent_id: &str,
         limit: i64,
     ) -> Result<Vec<AuditEventRow>, StoreError> {
-        let rows: Vec<(String, i64, String, String, String, i64)> = sqlx::query_as(
-            "SELECT id, timestamp_ms, agent_id, operation_name, outcome, latency_ms \
+        type Row = (String, i64, String, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, timestamp_ms, agent_id, operation_name, outcome, latency_ms, \
+              integration_slug, deny_reason, error_message, client_id, dlp_detections \
              FROM audit_events WHERE agent_id = ? ORDER BY timestamp_ms DESC LIMIT ?",
         )
         .bind(agent_id)
@@ -351,10 +362,55 @@ impl Store for SqliteStore {
         .map_err(store_err)?;
         Ok(rows
             .into_iter()
-            .map(|(id, timestamp_ms, agent_id, operation_name, outcome, latency_ms)| {
-                AuditEventRow { id, timestamp_ms, agent_id, operation_name, outcome, latency_ms }
+            .map(|(id, timestamp_ms, agent_id, operation_name, outcome, latency_ms,
+                   integration_slug, deny_reason, error_message, client_id, dlp_detections)| {
+                AuditEventRow {
+                    id, timestamp_ms, agent_id, operation_name, outcome, latency_ms,
+                    integration_slug, deny_reason, error_message, client_id, dlp_detections,
+                }
             })
             .collect())
+    }
+
+    async fn delete_old_audit_events(&self, before_ms: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM audit_events WHERE timestamp_ms < ?")
+            .bind(before_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn list_all_audit_events(&self, limit: i64) -> Result<Vec<AuditEventRow>, StoreError> {
+        type Row = (String, i64, String, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, timestamp_ms, agent_id, operation_name, outcome, latency_ms, \
+              integration_slug, deny_reason, error_message, client_id, dlp_detections \
+             FROM audit_events ORDER BY timestamp_ms DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows.into_iter().map(|(id, timestamp_ms, agent_id, operation_name, outcome, latency_ms,
+                integration_slug, deny_reason, error_message, client_id, dlp_detections)| {
+            AuditEventRow {
+                id, timestamp_ms, agent_id, operation_name, outcome, latency_ms,
+                integration_slug, deny_reason, error_message, client_id, dlp_detections,
+            }
+        }).collect())
+    }
+
+    async fn count_audit_events_since(&self, since_ms: i64) -> Result<(u64, u64), StoreError> {
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), SUM(CASE WHEN outcome LIKE 'denied:%' THEN 1 ELSE 0 END) \
+             FROM audit_events WHERE timestamp_ms >= ?",
+        )
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok((row.0 as u64, row.1 as u64))
     }
 
     async fn insert_access_token(&self, token: &AccessToken) -> Result<(), StoreError> {
@@ -401,20 +457,15 @@ impl Store for SqliteStore {
     }
 
     async fn upsert_policy_rule(&self, rule: &PolicyRule) -> Result<(), StoreError> {
-        let allowed_int: i64 = if rule.allowed { 1 } else { 0 };
-        sqlx::query(
-            "INSERT INTO policy_rules (agent_id, tool_name, allowed, created_at) \
-             VALUES (?, ?, ?, ?) \
-             ON CONFLICT(agent_id, tool_name) DO UPDATE SET allowed = excluded.allowed",
-        )
-        .bind(&rule.agent_id)
-        .bind(&rule.tool_name)
-        .bind(allowed_int)
-        .bind(rule.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(())
+        // Delegate to agent_overrides (policy_rules table removed in migration 0009)
+        let override_ = AgentOverride {
+            agent_id: rule.agent_id.clone(),
+            tool_name: rule.tool_name.clone(),
+            allowed: rule.allowed,
+            kind: AgentOverrideKind::Static,
+            created_at: rule.created_at,
+        };
+        self.upsert_agent_override(&override_).await
     }
 
     async fn delete_policy_rule(
@@ -422,33 +473,18 @@ impl Store for SqliteStore {
         agent_id: &str,
         tool_name: &str,
     ) -> Result<bool, StoreError> {
-        let result = sqlx::query(
-            "DELETE FROM policy_rules WHERE agent_id = ? AND tool_name = ?",
-        )
-        .bind(agent_id)
-        .bind(tool_name)
-        .execute(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(result.rows_affected() > 0)
+        self.delete_agent_override(agent_id, tool_name).await
     }
 
     async fn list_policy_rules(&self, agent_id: &str) -> Result<Vec<PolicyRule>, StoreError> {
-        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
-            "SELECT agent_id, tool_name, allowed, created_at \
-             FROM policy_rules WHERE agent_id = ? ORDER BY tool_name",
-        )
-        .bind(agent_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(rows
+        let overrides = self.list_agent_overrides(agent_id).await?;
+        Ok(overrides
             .into_iter()
-            .map(|(agent_id, tool_name, allowed, created_at)| PolicyRule {
-                agent_id,
-                tool_name,
-                allowed: allowed != 0,
-                created_at,
+            .map(|o| PolicyRule {
+                agent_id: o.agent_id,
+                tool_name: o.tool_name,
+                allowed: o.allowed,
+                created_at: o.created_at,
             })
             .collect())
     }
@@ -458,20 +494,12 @@ impl Store for SqliteStore {
         agent_id: &str,
         tool_name: &str,
     ) -> Result<Option<PolicyRule>, StoreError> {
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT allowed, created_at FROM policy_rules \
-             WHERE agent_id = ? AND tool_name = ?",
-        )
-        .bind(agent_id)
-        .bind(tool_name)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(store_err)?;
-        Ok(row.map(|(allowed, created_at)| PolicyRule {
-            agent_id: agent_id.to_string(),
-            tool_name: tool_name.to_string(),
-            allowed: allowed != 0,
-            created_at,
+        let override_ = self.get_agent_override(agent_id, tool_name).await?;
+        Ok(override_.map(|o| PolicyRule {
+            agent_id: o.agent_id,
+            tool_name: o.tool_name,
+            allowed: o.allowed,
+            created_at: o.created_at,
         }))
     }
 
@@ -481,10 +509,11 @@ impl Store for SqliteStore {
             None => None,
         };
         let connected: i64 = if integration.connected { 1 } else { 0 };
+        let default_stance: i64 = if integration.default_stance { 1 } else { 0 };
         sqlx::query(
             "INSERT INTO integrations \
-             (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, default_stance, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&integration.id)
         .bind(&integration.slug)
@@ -495,6 +524,7 @@ impl Store for SqliteStore {
         .bind(&integration.oauth_client_id)
         .bind(&scopes_json)
         .bind(connected)
+        .bind(default_stance)
         .bind(integration.created_at)
         .execute(&self.pool)
         .await
@@ -503,9 +533,9 @@ impl Store for SqliteStore {
     }
 
     async fn get_integration(&self, id: &str) -> Result<Option<Integration>, StoreError> {
-        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, i64)> =
             sqlx::query_as(
-                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, default_stance, created_at \
                  FROM integrations WHERE id = ?",
             )
             .bind(id)
@@ -516,9 +546,9 @@ impl Store for SqliteStore {
     }
 
     async fn get_integration_by_slug(&self, slug: &str) -> Result<Option<Integration>, StoreError> {
-        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+        let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, i64)> =
             sqlx::query_as(
-                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, default_stance, created_at \
                  FROM integrations WHERE slug = ?",
             )
             .bind(slug)
@@ -529,9 +559,9 @@ impl Store for SqliteStore {
     }
 
     async fn list_integrations(&self) -> Result<Vec<Integration>, StoreError> {
-        let rows: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
+        let rows: Vec<(String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, i64)> =
             sqlx::query_as(
-                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, created_at \
+                "SELECT id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes, connected, default_stance, created_at \
                  FROM integrations ORDER BY created_at DESC",
             )
             .fetch_all(&self.pool)
@@ -600,12 +630,373 @@ impl Store for SqliteStore {
             .map_err(store_err)?;
         Ok(result.rows_affected() > 0)
     }
+
+    // --- Profiles ---
+
+    async fn insert_profile(&self, profile: &Profile) -> Result<(), StoreError> {
+        let is_default: i64 = if profile.is_default { 1 } else { 0 };
+        sqlx::query(
+            "INSERT INTO profiles (id, name, description, is_default, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&profile.id)
+        .bind(&profile.name)
+        .bind(&profile.description)
+        .bind(is_default)
+        .bind(profile.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err_db)?;
+        Ok(())
+    }
+
+    async fn get_profile(&self, id: &str) -> Result<Option<Profile>, StoreError> {
+        let row: Option<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
+            "SELECT id, name, description, is_default, created_at FROM profiles WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.map(|(id, name, description, is_default, created_at)| Profile {
+            id,
+            name,
+            description,
+            is_default: is_default != 0,
+            created_at,
+        }))
+    }
+
+    async fn list_profiles(&self) -> Result<Vec<Profile>, StoreError> {
+        let rows: Vec<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
+            "SELECT id, name, description, is_default, created_at FROM profiles ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, description, is_default, created_at)| Profile {
+                id,
+                name,
+                description,
+                is_default: is_default != 0,
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn update_profile(&self, id: &str, name: &str, description: Option<&str>) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE profiles SET name = ?, description = ? WHERE id = ?",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_profile(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM profiles WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // --- Profile rules ---
+
+    async fn upsert_profile_rule(&self, rule: &ProfileRule) -> Result<(), StoreError> {
+        let allowed: i64 = if rule.allowed { 1 } else { 0 };
+        sqlx::query(
+            "INSERT INTO profile_rules (profile_id, tool_name, allowed, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(profile_id, tool_name) DO UPDATE SET allowed = excluded.allowed",
+        )
+        .bind(&rule.profile_id)
+        .bind(&rule.tool_name)
+        .bind(allowed)
+        .bind(rule.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_profile_rule(&self, profile_id: &str, tool_name: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM profile_rules WHERE profile_id = ? AND tool_name = ?",
+        )
+        .bind(profile_id)
+        .bind(tool_name)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_profile_rules(&self, profile_id: &str) -> Result<Vec<ProfileRule>, StoreError> {
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT profile_id, tool_name, allowed, created_at \
+             FROM profile_rules WHERE profile_id = ? ORDER BY tool_name",
+        )
+        .bind(profile_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(profile_id, tool_name, allowed, created_at)| ProfileRule {
+                profile_id,
+                tool_name,
+                allowed: allowed != 0,
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn get_profile_rule(&self, profile_id: &str, tool_name: &str) -> Result<Option<ProfileRule>, StoreError> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT allowed, created_at FROM profile_rules WHERE profile_id = ? AND tool_name = ?",
+        )
+        .bind(profile_id)
+        .bind(tool_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.map(|(allowed, created_at)| ProfileRule {
+            profile_id: profile_id.to_string(),
+            tool_name: tool_name.to_string(),
+            allowed: allowed != 0,
+            created_at,
+        }))
+    }
+
+    async fn set_profile_rules_for_integration(
+        &self,
+        profile_id: &str,
+        tool_names: &[String],
+        allowed: bool,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let allowed_int: i64 = if allowed { 1 } else { 0 };
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        for tool_name in tool_names {
+            sqlx::query(
+                "INSERT OR REPLACE INTO profile_rules (profile_id, tool_name, allowed, created_at) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(profile_id)
+            .bind(tool_name)
+            .bind(allowed_int)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(store_err)?;
+        }
+        tx.commit().await.map_err(store_err)
+    }
+
+    // --- Global rules ---
+
+    async fn upsert_global_rule(&self, rule: &GlobalRule) -> Result<(), StoreError> {
+        let allowed: i64 = if rule.allowed { 1 } else { 0 };
+        sqlx::query(
+            "INSERT INTO global_rules (tool_name, allowed, created_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(tool_name) DO UPDATE SET allowed = excluded.allowed",
+        )
+        .bind(&rule.tool_name)
+        .bind(allowed)
+        .bind(rule.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_global_rule(&self, tool_name: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM global_rules WHERE tool_name = ?")
+            .bind(tool_name)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_global_rules(&self) -> Result<Vec<GlobalRule>, StoreError> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT tool_name, allowed, created_at FROM global_rules ORDER BY tool_name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(tool_name, allowed, created_at)| GlobalRule {
+                tool_name,
+                allowed: allowed != 0,
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn get_global_rule(&self, tool_name: &str) -> Result<Option<GlobalRule>, StoreError> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT allowed, created_at FROM global_rules WHERE tool_name = ?",
+        )
+        .bind(tool_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.map(|(allowed, created_at)| GlobalRule {
+            tool_name: tool_name.to_string(),
+            allowed: allowed != 0,
+            created_at,
+        }))
+    }
+
+    // --- Agent overrides ---
+
+    async fn upsert_agent_override(&self, override_: &AgentOverride) -> Result<(), StoreError> {
+        let allowed: i64 = if override_.allowed { 1 } else { 0 };
+        let (kind_str, expires_at, remaining) = match &override_.kind {
+            AgentOverrideKind::Static => ("static", None::<i64>, None::<i64>),
+            AgentOverrideKind::Until { expires_at } => ("until", Some(*expires_at), None),
+            AgentOverrideKind::Uses { remaining } => ("uses", None, Some(*remaining)),
+        };
+        sqlx::query(
+            "INSERT INTO agent_overrides (agent_id, tool_name, allowed, kind, expires_at, remaining, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(agent_id, tool_name) DO UPDATE SET \
+               allowed = excluded.allowed, \
+               kind = excluded.kind, \
+               expires_at = excluded.expires_at, \
+               remaining = excluded.remaining",
+        )
+        .bind(&override_.agent_id)
+        .bind(&override_.tool_name)
+        .bind(allowed)
+        .bind(kind_str)
+        .bind(expires_at)
+        .bind(remaining)
+        .bind(override_.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn delete_agent_override(&self, agent_id: &str, tool_name: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM agent_overrides WHERE agent_id = ? AND tool_name = ?",
+        )
+        .bind(agent_id)
+        .bind(tool_name)
+        .execute(&self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_agent_overrides(&self, agent_id: &str) -> Result<Vec<AgentOverride>, StoreError> {
+        let rows: Vec<(String, String, i64, String, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT agent_id, tool_name, allowed, kind, expires_at, remaining, created_at \
+             FROM agent_overrides WHERE agent_id = ? ORDER BY tool_name",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_err)?;
+        rows.into_iter()
+            .map(|(agent_id, tool_name, allowed, kind, expires_at, remaining, created_at)| {
+                let kind = parse_override_kind(&kind, expires_at, remaining)?;
+                Ok(AgentOverride {
+                    agent_id,
+                    tool_name,
+                    allowed: allowed != 0,
+                    kind,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn get_agent_override(&self, agent_id: &str, tool_name: &str) -> Result<Option<AgentOverride>, StoreError> {
+        let row: Option<(i64, String, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT allowed, kind, expires_at, remaining, created_at \
+             FROM agent_overrides WHERE agent_id = ? AND tool_name = ?",
+        )
+        .bind(agent_id)
+        .bind(tool_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_err)?;
+        match row {
+            None => Ok(None),
+            Some((allowed, kind, expires_at, remaining, created_at)) => {
+                let kind = parse_override_kind(&kind, expires_at, remaining)?;
+                Ok(Some(AgentOverride {
+                    agent_id: agent_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    allowed: allowed != 0,
+                    kind,
+                    created_at,
+                }))
+            }
+        }
+    }
+
+    // --- Profile assignment ---
+
+    async fn set_agent_profile(&self, agent_id: &str, profile_id: Option<&str>) -> Result<(), StoreError> {
+        sqlx::query("UPDATE oauth_clients SET profile_id = ? WHERE agent_id = ?")
+            .bind(profile_id)
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn get_agent_profile_id(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT profile_id FROM oauth_clients WHERE agent_id = ?")
+                .bind(agent_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(store_err)?;
+        Ok(row.and_then(|(pid,)| pid))
+    }
+}
+
+fn parse_override_kind(kind: &str, expires_at: Option<i64>, remaining: Option<i64>) -> Result<AgentOverrideKind, StoreError> {
+    match kind {
+        "static" => Ok(AgentOverrideKind::Static),
+        "until" => {
+            let expires_at = expires_at.ok_or_else(|| {
+                StoreError::Internal("agent_override kind='until' missing expires_at".to_string())
+            })?;
+            Ok(AgentOverrideKind::Until { expires_at })
+        }
+        "uses" => {
+            let remaining = remaining.ok_or_else(|| {
+                StoreError::Internal("agent_override kind='uses' missing remaining".to_string())
+            })?;
+            Ok(AgentOverrideKind::Uses { remaining })
+        }
+        other => Err(StoreError::Internal(format!("unknown agent_override kind: {other}"))),
+    }
 }
 
 fn parse_integration_row(
-    row: (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64),
+    row: (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64, i64),
 ) -> Result<Integration, StoreError> {
-    let (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes_json, connected, created_at) = row;
+    let (id, slug, name, mcp_url, oauth_auth_url, oauth_token_url, oauth_client_id, oauth_scopes_json, connected, default_stance, created_at) = row;
     let oauth_scopes = match oauth_scopes_json {
         Some(json) => Some(serde_json::from_str::<Vec<String>>(&json).map_err(store_err)?),
         None => None,
@@ -620,6 +1011,7 @@ fn parse_integration_row(
         oauth_client_id,
         oauth_scopes,
         connected: connected != 0,
+        default_stance: default_stance != 0,
         created_at,
     })
 }

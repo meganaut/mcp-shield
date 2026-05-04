@@ -12,4 +12,5 @@ pub mod session;
 pub mod setup;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod ui;
 pub mod vault;

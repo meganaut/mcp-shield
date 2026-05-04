@@ -153,6 +153,8 @@ pub struct AppState {
     pub rate_limiter: RateLimiterStore,
     pub admin_rate_limiter: RateLimiterStore,
     pub setup_csrf_token: String,
+    /// HMAC-SHA256 key for signing admin UI session cookies (random per process).
+    pub admin_session_key: [u8; 32],
     /// token_hash → (agent_id, client_id, expiry_unix_secs)
     pub bearer_cache: Arc<DashMap<String, (String, String, i64)>>,
     /// integration_id → (token_data, cached_at)
@@ -161,6 +163,12 @@ pub struct AppState {
 
 pub fn new_setup_csrf_token() -> String {
     crate::crypto::random_base64url(32)
+}
+
+pub fn new_admin_session_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    key
 }
 
 /// Authenticated agent extracted from a Bearer token.
@@ -248,7 +256,7 @@ pub async fn mcp_handler_no_auth(
 
             match method {
                 "tools/list" => handle_tools_list(state, req, session.agent_id).await,
-                "tools/call" => handle_tools_call(state, req, session.agent_id).await,
+                "tools/call" => handle_tools_call(state, req, session.agent_id, None).await,
                 _ => {
                     if is_notification {
                         notification_ack()
@@ -431,7 +439,7 @@ pub async fn mcp_handler_authenticated(
 
             match method {
                 "tools/list" => handle_tools_list(state, req, session.agent_id).await,
-                "tools/call" => handle_tools_call(state, req, session.agent_id).await,
+                "tools/call" => handle_tools_call(state, req, session.agent_id, Some(agent.client_id)).await,
                 _ => {
                     if is_notification {
                         notification_ack()
@@ -557,15 +565,17 @@ fn emit_audit(state: &Arc<AppState>, event: AuditEvent) {
 }
 
 fn tool_call_event(
+    call_id: Uuid,
     agent_id: &AgentId,
     integration_id: &IntegrationId,
     slug: &str,
     tool: &str,
     outcome: AuditOutcome,
     latency_ms: u64,
+    client_id: Option<String>,
 ) -> AuditEvent {
     AuditEvent {
-        id: Uuid::new_v4(),
+        id: call_id,
         timestamp: Utc::now(),
         agent_id: agent_id.clone(),
         integration_id: Some(integration_id.clone()),
@@ -574,6 +584,7 @@ fn tool_call_event(
         outcome,
         dlp_detections: vec![],
         latency_ms,
+        client_id,
     }
 }
 
@@ -652,7 +663,7 @@ async fn handle_tools_list(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     json_response(resp)
 }
 
-async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: String) -> Response {
+async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: String, client_id: Option<String>) -> Response {
     let req_id = match require_id(&req) {
         Ok(id) => id,
         Err(resp) => return resp,
@@ -718,6 +729,9 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     let integration_id = IntegrationId(Uuid::nil());
     let call_params = params.arguments.clone().unwrap_or(serde_json::Value::Null);
 
+    // Generate a stable correlation ID before the call so logs can be joined on it.
+    let call_id = Uuid::new_v4();
+
     // Policy check uses the full namespaced name
     let decision = match state
         .policy
@@ -732,16 +746,19 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     };
 
     if !decision.allowed {
+        let deny_reason = decision.reason.unwrap_or_else(|| "policy deny".to_string());
         let latency_ms = call_start.elapsed().as_millis() as u64;
         emit_audit(
             &state,
             tool_call_event(
+                call_id,
                 &parsed_agent_id,
                 &integration_id,
                 tool_slug,
                 local_name,
-                AuditOutcome::Denied { reason: "policy deny".to_string() },
+                AuditOutcome::Denied { reason: deny_reason },
                 latency_ms,
+                client_id,
             ),
         );
         return error_json(error_response(
@@ -754,18 +771,23 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
     // Get auth token from vault cache (non-fatal — None means no auth header)
     let auth_token = get_vault_token_cached(&state, &downstream.integration_id).await;
 
+    let span = tracing::info_span!("tools/call", call_id = %call_id, tool = %tool_name);
+    let _enter = span.enter();
+
     match downstream.call_tool(local_name, params.arguments, auth_token.as_deref()).await {
         Ok(JsonRpcOutcome::Success(downstream_resp)) => {
             let latency_ms = call_start.elapsed().as_millis() as u64;
             emit_audit(
                 &state,
                 tool_call_event(
+                    call_id,
                     &parsed_agent_id,
                     &integration_id,
                     tool_slug,
                     local_name,
                     AuditOutcome::Allowed,
                     latency_ms,
+                    client_id,
                 ),
             );
             let resp = JsonRpcResponse {
@@ -780,12 +802,14 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
             emit_audit(
                 &state,
                 tool_call_event(
+                    call_id,
                     &parsed_agent_id,
                     &integration_id,
                     tool_slug,
                     local_name,
                     AuditOutcome::Allowed,
                     latency_ms,
+                    client_id,
                 ),
             );
             error_json(JsonRpcError {
@@ -800,12 +824,14 @@ async fn handle_tools_call(state: Arc<AppState>, req: JsonRpcRequest, agent_id: 
             emit_audit(
                 &state,
                 tool_call_event(
+                    call_id,
                     &parsed_agent_id,
                     &integration_id,
                     tool_slug,
                     local_name,
                     AuditOutcome::Error { detail: "downstream unavailable".to_string() },
                     latency_ms,
+                    client_id,
                 ),
             );
             error_json(error_response(Some(req_id), ERR_INTERNAL, "downstream unavailable"))
