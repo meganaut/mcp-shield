@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} — Tools{% endblock %}
+{% block nav_integrations %}active{% endblock %}
+{% block mob_integrations %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Header -->
+  <div class="flex items-start justify-between gap-4 flex-wrap">
+    <div class="flex flex-col gap-1">
+      <div class="text-sm text-base-content/50 flex items-center gap-1">
+        <a href="/ui/integrations" class="link link-hover">Integrations</a>
+        <span>›</span>
+        <span>{{ name }}</span>
+        <span>›</span>
+        <span>Tools</span>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <h2 class="text-2xl font-bold">{{ name }}</h2>
+        <code class="text-xs bg-base-200 px-2 py-1 rounded font-bold text-base-content/70">{{ slug }}</code>
+        {% if connected %}
+        <span class="badge badge-success badge-sm gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-current inline-block"></span>
+          Connected
+        </span>
+        {% else %}
+        <span class="badge badge-ghost badge-sm gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-base-content/50 inline-block"></span>
+          Not connected
+        </span>
+        {% endif %}
+      </div>
+      <p class="text-xs text-base-content/40 font-mono">{{ mcp_url }}</p>
+    </div>
+    <div class="flex gap-2 flex-shrink-0">
+      <button class="btn btn-ghost btn-sm">Refresh catalogue</button>
+      <a href="/ui/integrations" class="btn btn-ghost btn-sm">← Back</a>
+    </div>
+  </div>
+
+  <!-- Stats + search bar -->
+  <div class="flex items-center gap-4 flex-wrap">
+    <div class="badge badge-neutral badge-lg gap-2 font-normal">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+      </svg>
+      {{ tool_count }} tools in catalogue
+    </div>
+
+    <label class="input input-bordered flex items-center gap-2 max-w-sm">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-base-content/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+      </svg>
+      <input type="text" placeholder="Filter tools…" class="grow" oninput="filterTools(this.value)">
+    </label>
+  </div>
+
+  <!-- Tool list -->
+  {% if tools.is_empty() %}
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body items-center py-16 text-center">
+      {% if connected %}
+      <p class="font-semibold">No tools in catalogue</p>
+      <p class="text-base-content/60 text-sm">Click <strong>Refresh catalogue</strong> to fetch tools from the MCP server.</p>
+      {% else %}
+      <p class="font-semibold">Integration not connected</p>
+      <p class="text-base-content/60 text-sm">Connect this integration to load its tool catalogue.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% else %}
+  <div class="card bg-base-100 shadow-sm overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="table table-sm" id="tools-table">
+        <thead>
+          <tr class="text-xs text-base-content/60 bg-base-200/50">
+            <th>Tool name</th>
+            <th>Namespaced name</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in tools %}
+          <tr class="hover tool-row">
+            <td>
+              <div class="flex items-center gap-2">
+                {% if t.access_type == "write" %}
+                <span class="badge badge-sm badge-warning font-mono font-bold flex-shrink-0" style="min-width:3.2rem">write</span>
+                {% else if t.access_type == "read" %}
+                <span class="badge badge-sm badge-info font-mono font-bold flex-shrink-0" style="min-width:3.2rem">read</span>
+                {% else %}
+                <span class="badge badge-sm badge-ghost font-mono font-bold flex-shrink-0" style="min-width:3.2rem">?</span>
+                {% endif %}
+                <code class="text-xs font-semibold">{{ t.local_name }}</code>
+              </div>
+            </td>
+            <td>
+              <code class="text-xs text-base-content/60">{{ t.full_name }}</code>
+            </td>
+            <td class="text-sm text-base-content/70 max-w-lg">
+              {% if let Some(desc) = t.description %}
+              <span class="desc-cell line-clamp-1 cursor-pointer select-none" title="{{ desc }}" onclick="toggleDesc(this)">{{ desc }}</span>
+              {% else %}
+              <span class="text-base-content/50">No description</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+<script>
+function filterTools(query) {
+  var q = query.toLowerCase();
+  document.querySelectorAll('.tool-row').forEach(function(row) {
+    var text = row.textContent.toLowerCase();
+    row.style.display = (!q || text.includes(q)) ? '' : 'none';
+  });
+}
+function toggleDesc(el) {
+  var clamped = el.classList.contains('line-clamp-1');
+  el.classList.toggle('line-clamp-1', !clamped);
+  el.style.cursor = clamped ? 'zoom-out' : 'pointer';
+}
+</script>
+{% endblock %}

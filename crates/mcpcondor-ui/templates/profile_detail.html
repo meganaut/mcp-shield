@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} — Profile{% endblock %}
+{% block nav_profiles %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Header -->
+  <div class="flex items-start justify-between gap-4 flex-wrap">
+    <div class="flex flex-col gap-1">
+      <div class="text-sm text-base-content/50 flex items-center gap-1">
+        <a href="/ui/profiles" class="link link-hover">Profiles</a>
+        <span>›</span>
+        <span>{{ name }}</span>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <h2 class="text-2xl font-bold">{{ name }}</h2>
+        {% if is_default %}
+        <span class="badge badge-primary">Default</span>
+        {% endif %}
+        <span class="text-base-content/50 text-sm">{{ agent_count }} agent{% if agent_count != 1 %}s{% endif %}</span>
+      </div>
+      {% if let Some(desc) = description %}
+      <p class="text-sm text-base-content/60">{{ desc }}</p>
+      {% endif %}
+    </div>
+    <div class="flex gap-2 flex-shrink-0">
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('modal-rename').showModal()">Rename</button>
+      {% if !is_default %}
+      <button class="btn btn-ghost btn-sm">Clone</button>
+      <button class="btn btn-ghost btn-sm text-error">Delete</button>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Stats bar -->
+  <div class="flex items-center gap-4 flex-wrap">
+    <div class="stats shadow-sm bg-base-100 stats-horizontal">
+      <div class="stat py-3 px-5">
+        <div class="stat-title text-xs">Tools allowed</div>
+        <div class="stat-value text-2xl text-success">{{ allowed_total }}</div>
+        <div class="stat-desc">of {{ tool_total }} total</div>
+      </div>
+      <div class="stat py-3 px-5">
+        <div class="stat-title text-xs">Integrations</div>
+        <div class="stat-value text-2xl">{{ groups_count }}</div>
+        <div class="stat-desc">with tool rules</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Search -->
+  <label class="input input-bordered flex items-center gap-2 max-w-sm">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-base-content/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+    </svg>
+    <input type="text" placeholder="Filter tools…" class="grow" id="tool-search" oninput="filterTools(this.value)">
+  </label>
+
+  <!-- Per-integration sections -->
+  {% for g in groups %}
+  <div class="card bg-base-100 shadow-sm" id="group-{{ g.integration_slug }}">
+    <!-- Integration header -->
+    <div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-base-200 flex-wrap">
+      <div class="flex items-center gap-3">
+        <code class="text-xs bg-base-200 px-2 py-0.5 rounded font-bold text-base-content/70">{{ g.integration_slug }}</code>
+        <span class="font-semibold">{{ g.integration_name }}</span>
+        <span class="text-sm text-base-content/50">{{ g.allowed_count }}/{{ g.tool_count }} allowed</span>
+      </div>
+      <div class="flex gap-2">
+        <button class="btn btn-xs btn-ghost" onclick="setAllInGroup('{{ g.integration_slug }}', false)">Deny all</button>
+        <button class="btn btn-xs btn-primary" onclick="setAllInGroup('{{ g.integration_slug }}', true)">Allow all</button>
+      </div>
+    </div>
+    <!-- Tool rows -->
+    <div class="overflow-x-auto">
+      <table class="table table-sm" id="table-{{ g.integration_slug }}">
+        <tbody>
+          {% for t in g.tools %}
+          <tr class="hover tool-row {% if t.effective_state != "profile" %}opacity-70{% endif %}" data-tool="{{ t.full_name }}">
+            <td class="w-12">
+              {% if t.effective_state == "global_deny" %}
+              <input type="checkbox" class="toggle toggle-sm cursor-not-allowed" disabled title="Blocked by a global rule — cannot be overridden by profile">
+              {% else if t.effective_state == "global_allow" %}
+              <input type="checkbox" class="toggle toggle-success toggle-sm cursor-not-allowed" checked disabled title="Allowed by a global rule — always available regardless of profile">
+              {% else %}
+              <input type="checkbox" class="toggle toggle-success toggle-sm tool-toggle"
+                     data-integration="{{ g.integration_slug }}"
+                     {% if t.allowed %}checked{% endif %}
+                     onchange="onToolToggle(this)">
+              {% endif %}
+            </td>
+            <td class="w-72">
+              <div class="flex items-center gap-2">
+                {% if t.access_type == "write" %}
+                <span class="badge badge-sm badge-warning font-mono font-bold" style="min-width:3.2rem">write</span>
+                {% else if t.access_type == "read" %}
+                <span class="badge badge-sm badge-info font-mono font-bold" style="min-width:3.2rem">read</span>
+                {% else %}
+                <span class="badge badge-sm badge-ghost font-mono font-bold" style="min-width:3.2rem">?</span>
+                {% endif %}
+                <code class="text-xs font-medium text-base-content">{{ t.full_name }}</code>
+              </div>
+            </td>
+            <td class="text-sm text-base-content/60 max-w-lg">
+              {% if let Some(desc) = t.description %}
+              <span class="line-clamp-1 cursor-pointer select-none" title="{{ desc }}" onclick="toggleDesc(this)">{{ desc }}</span>
+              {% endif %}
+            </td>
+            <td class="text-right" style="min-width:8rem">
+              {% if t.effective_state == "global_deny" %}
+              <span class="badge badge-error badge-sm whitespace-nowrap" title="A global hard-deny rule blocks this tool for all agents. Go to Global Rules to change this.">globally denied</span>
+              {% else if t.effective_state == "global_allow" %}
+              <span class="badge badge-info badge-sm whitespace-nowrap" title="A global allow rule grants this tool to all agents. Profile rules are ignored.">globally allowed</span>
+              {% else if t.allowed %}
+              <span class="badge badge-success badge-sm tool-badge">allowed</span>
+              {% else %}
+              <span class="badge badge-ghost badge-sm tool-badge">denied</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endfor %}
+
+</div>
+
+<!-- Rename modal -->
+<dialog id="modal-rename" class="modal">
+  <div class="modal-box w-full max-w-md">
+    <h3 class="font-bold text-lg mb-4">Rename profile</h3>
+    <form method="POST" action="/ui/profiles/{{ id }}/rename" class="flex flex-col gap-3">
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Name</span></div>
+        <input type="text" name="name" value="{{ name }}" class="input input-bordered" required>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Description</span></div>
+        <input type="text" name="description" value="{% if let Some(d) = description %}{{ d }}{% endif %}" class="input input-bordered">
+      </label>
+      <div class="modal-action mt-2">
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('modal-rename').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+function filterTools(query) {
+  var q = query.toLowerCase();
+  document.querySelectorAll('.tool-row').forEach(function(row) {
+    var name = row.dataset.tool || '';
+    var match = !q || name.toLowerCase().includes(q);
+    row.style.display = match ? '' : 'none';
+  });
+  // Hide group cards where all rows are hidden
+  document.querySelectorAll('[id^="group-"]').forEach(function(card) {
+    var slug = card.id.replace('group-', '');
+    var rows = card.querySelectorAll('.tool-row');
+    var anyVisible = Array.from(rows).some(function(r) { return r.style.display !== 'none'; });
+    card.style.display = anyVisible ? '' : 'none';
+  });
+}
+
+function onToolToggle(cb) {
+  var row = cb.closest('tr');
+  var badge = row.querySelector('.tool-badge');
+  if (cb.checked) {
+    badge.textContent = 'allowed';
+    badge.className = 'badge badge-success badge-sm tool-badge';
+  } else {
+    badge.textContent = 'denied';
+    badge.className = 'badge badge-ghost badge-sm tool-badge';
+  }
+}
+
+function setAllInGroup(slug, allow) {
+  var table = document.getElementById('table-' + slug);
+  if (!table) return;
+  table.querySelectorAll('.tool-toggle').forEach(function(cb) {
+    cb.checked = allow;
+    onToolToggle(cb);
+  });
+}
+function toggleDesc(el) {
+  var clamped = el.classList.contains('line-clamp-1');
+  el.classList.toggle('line-clamp-1', !clamped);
+  el.style.cursor = clamped ? 'zoom-out' : 'pointer';
+}
+</script>
+{% endblock %}

@@ -20,6 +20,10 @@ async fn page_agents() -> Html<String> { render(mock::agents()) }
 async fn page_profiles() -> Html<String> { render(mock::profiles()) }
 async fn page_audit() -> Html<String> { render(mock::audit()) }
 
+async fn page_profile_detail() -> Html<String> { render(mock::profile_detail()) }
+async fn page_agent_detail() -> Html<String> { render(mock::agent_detail()) }
+async fn page_integration_tools() -> Html<String> { render(mock::integration_tools()) }
+
 async fn page_logo() -> Html<String> {
     Html(r##"<!DOCTYPE html>
 <html lang="en">
@@ -288,6 +292,7 @@ async fn static_asset(Path(path): Path<String>) -> Response {
 #[tokio::main]
 async fn main() {
     let app = Router::new()
+        // root and bare paths (direct browser access)
         .route("/", get(page_dashboard))
         .route("/login", get(page_login))
         .route("/login/error", get(page_login_err))
@@ -296,6 +301,23 @@ async fn main() {
         .route("/agents", get(page_agents))
         .route("/profiles", get(page_profiles))
         .route("/audit", get(page_audit))
+        .route("/profiles/p2", get(page_profile_detail))
+        .route("/agents/a1", get(page_agent_detail))
+        .route("/integrations/1/tools", get(page_integration_tools))
+        // /ui/* paths — mirrors production routing so template links work
+        .route("/ui", get(page_dashboard))
+        .route("/ui/login", get(page_login))
+        .route("/ui/dashboard", get(page_dashboard))
+        .route("/ui/integrations", get(page_integrations))
+        .route("/ui/agents", get(page_agents))
+        .route("/ui/profiles", get(page_profiles))
+        .route("/ui/audit", get(page_audit))
+        .route("/ui/profiles/p2", get(page_profile_detail))
+        .route("/ui/profiles/{_id}", get(page_profile_detail))
+        .route("/ui/agents/a1", get(page_agent_detail))
+        .route("/ui/agents/{_id}", get(page_agent_detail))
+        .route("/ui/integrations/1/tools", get(page_integration_tools))
+        .route("/ui/integrations/{_id}/tools", get(page_integration_tools))
         .route("/icons", get(page_icons))
         .route("/logo", get(page_logo))
         .route("/assets/{*path}", get(static_asset));

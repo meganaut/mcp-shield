@@ -68,13 +68,13 @@
               </span>
               {% else %}
               <span class="badge badge-ghost badge-sm gap-1">
-                <span class="w-1.5 h-1.5 rounded-full bg-base-content/30 inline-block"></span>
+                <span class="w-1.5 h-1.5 rounded-full bg-base-content/50 inline-block"></span>
                 Not connected
               </span>
               {% endif %}
             </td>
             <td class="text-sm">
-              {% if i.connected %}{{ i.tool_count }} tools{% else %}<span class="text-base-content/40">—</span>{% endif %}
+              {% if i.connected %}{{ i.tool_count }} tools{% else %}<span class="text-base-content/50">—</span>{% endif %}
             </td>
             <td>
               {% if i.default_stance == "allow" %}

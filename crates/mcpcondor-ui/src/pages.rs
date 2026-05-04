@@ -105,3 +105,94 @@ pub struct AuditPage {
     pub page: u32,
     pub total_pages: u32,
 }
+
+// ── Profile detail ────────────────────────────────────────────────────────────
+
+pub struct ProfileToolRow {
+    pub local_name: String,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub allowed: bool,
+    /// "read", "write", or "unknown"
+    pub access_type: String,
+    /// "profile" | "global_deny" | "global_allow"
+    pub effective_state: String,
+}
+
+pub struct ProfileToolGroup {
+    pub integration_slug: String,
+    pub integration_name: String,
+    pub allowed_count: usize,
+    pub tool_count: usize,
+    pub tools: Vec<ProfileToolRow>,
+}
+
+#[derive(Template)]
+#[template(path = "profile_detail.html")]
+pub struct ProfileDetailPage {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_default: bool,
+    pub agent_count: u32,
+    pub groups_count: usize,
+    pub groups: Vec<ProfileToolGroup>,
+    pub allowed_total: usize,
+    pub tool_total: usize,
+}
+
+// ── Agent detail ──────────────────────────────────────────────────────────────
+
+pub struct AgentSessionRow {
+    pub token_prefix: String,
+    pub created_at: String,
+    pub last_used: String,
+    pub expires_at: String,
+}
+
+pub struct AgentOverrideRow {
+    pub tool_name: String,
+    pub allowed: bool,
+    /// "static" | "until" | "uses"
+    pub kind: String,
+    pub expires_at: Option<String>,
+    pub near_expiry: bool,
+    /// Pre-formatted label like "7 uses remaining"
+    pub remaining_label: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "agent_detail.html")]
+pub struct AgentDetailPage {
+    pub id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub created_at: String,
+    pub sessions: Vec<AgentSessionRow>,
+    pub overrides: Vec<AgentOverrideRow>,
+    pub overrides_count: usize,
+}
+
+// ── Integration tools ─────────────────────────────────────────────────────────
+
+pub struct IntegrationToolRow {
+    pub local_name: String,
+    pub full_name: String,
+    pub description: Option<String>,
+    /// "read" or "write"
+    pub access_type: String,
+}
+
+#[derive(Template)]
+#[template(path = "integration_tools.html")]
+pub struct IntegrationToolsPage {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub mcp_url: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub tools: Vec<IntegrationToolRow>,
+}

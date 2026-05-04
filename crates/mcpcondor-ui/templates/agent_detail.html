@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} — Agent{% endblock %}
+{% block nav_agents %}active{% endblock %}
+{% block mob_agents %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Header -->
+  <div class="flex items-start justify-between gap-4 flex-wrap">
+    <div class="flex flex-col gap-1">
+      <div class="text-sm text-base-content/50 flex items-center gap-1">
+        <a href="/ui/agents" class="link link-hover">Agents</a>
+        <span>›</span>
+        <span>{{ name }}</span>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <h2 class="text-2xl font-bold">{{ name }}</h2>
+        {% if agent_type == "attended" %}
+        <span class="badge badge-info">Attended</span>
+        {% else %}
+        <span class="badge badge-ghost">Unattended</span>
+        {% endif %}
+      </div>
+      <div class="flex items-center gap-2 text-sm text-base-content/60">
+        <span>Profile:</span>
+        <a href="/ui/profiles/{{ profile_id }}" class="link link-hover font-medium text-base-content">{{ profile_name }}</a>
+        <span class="text-base-content/50">·</span>
+        <span>Registered {{ created_at }}</span>
+      </div>
+    </div>
+    <div class="flex gap-2 flex-shrink-0">
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('modal-change-profile').showModal()">Change profile</button>
+      <button class="btn btn-ghost btn-sm text-warning" onclick="confirmRevoke()">Revoke tokens</button>
+      <button class="btn btn-ghost btn-sm text-error">Delete agent</button>
+    </div>
+  </div>
+
+  <!-- Sessions -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body gap-3">
+      <div class="flex items-center justify-between">
+        <h3 class="font-semibold">Active sessions</h3>
+        {% if sessions.is_empty() %}
+        {% else %}
+        <button class="btn btn-ghost btn-xs text-warning">Revoke all</button>
+        {% endif %}
+      </div>
+      {% if sessions.is_empty() %}
+      <p class="text-sm text-base-content/50 py-2">No active sessions. Agent will need to re-authenticate.</p>
+      {% else %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr class="text-xs text-base-content/50 bg-base-200/50">
+              <th>Token</th>
+              <th>Issued</th>
+              <th>Last used</th>
+              <th>Expires</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in sessions %}
+            <tr class="hover">
+              <td><code class="text-xs">{{ s.token_prefix }}</code></td>
+              <td class="text-sm text-base-content/60">{{ s.created_at }}</td>
+              <td class="text-sm">{{ s.last_used }}</td>
+              <td class="text-sm text-base-content/60">{{ s.expires_at }}</td>
+              <td class="text-right">
+                <button class="btn btn-xs btn-ghost text-error">Revoke</button>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Overrides -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body gap-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <h3 class="font-semibold">Tool overrides</h3>
+          <p class="text-xs text-base-content/50 mt-0.5">Per-agent exceptions from the <a href="/ui/profiles/{{ profile_id }}" class="link link-hover">{{ profile_name }}</a> profile</p>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="document.getElementById('modal-add-override').showModal()">Add override</button>
+      </div>
+
+      {% if overrides.is_empty() %}
+      <div class="py-4 text-center">
+        <p class="text-sm text-base-content/50">No overrides — agent uses the profile rules exactly.</p>
+      </div>
+      {% else %}
+      <div class="alert alert-warning alert-soft py-2 px-3">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+        </svg>
+        <span class="text-sm">{{ overrides_count }} overrides active — deviations from the profile are highlighted below.</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr class="text-xs text-base-content/50 bg-base-200/50">
+              <th>Tool</th>
+              <th>Decision</th>
+              <th>Type</th>
+              <th>Details</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for o in overrides %}
+            <tr class="hover">
+              <td>
+                <code class="text-xs font-medium">{{ o.tool_name }}</code>
+              </td>
+              <td>
+                {% if o.allowed %}
+                <span class="badge badge-success badge-sm">allowed</span>
+                {% else %}
+                <span class="badge badge-error badge-sm">denied</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if o.kind == "until" %}
+                <span class="badge badge-warning badge-outline badge-sm">time-bounded</span>
+                {% else if o.kind == "uses" %}
+                <span class="badge badge-info badge-outline badge-sm">use-count</span>
+                {% else %}
+                <span class="badge badge-ghost badge-sm">static</span>
+                {% endif %}
+              </td>
+              <td class="text-sm">
+                {% if o.kind == "until" %}
+                  {% if let Some(exp) = o.expires_at %}
+                  <span class="{% if o.near_expiry %}text-error font-medium{% else %}text-base-content/60{% endif %}">
+                    Expires {{ exp }}
+                    {% if o.near_expiry %}<span class="badge badge-error badge-xs ml-1">expiring soon</span>{% endif %}
+                  </span>
+                  {% endif %}
+                {% else if o.kind == "uses" %}
+                  {% if let Some(label) = o.remaining_label %}
+                  <span class="text-base-content/60">{{ label }}</span>
+                  {% endif %}
+                {% else %}
+                <span class="text-base-content/50">—</span>
+                {% endif %}
+              </td>
+              <td class="text-right">
+                <button class="btn btn-xs btn-ghost text-error">Remove</button>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<!-- Change profile modal -->
+<dialog id="modal-change-profile" class="modal">
+  <div class="modal-box w-full max-w-md">
+    <h3 class="font-bold text-lg mb-4">Change profile</h3>
+    <form method="POST" action="/ui/agents/{{ id }}/profile" class="flex flex-col gap-3">
+      <p class="text-sm text-base-content/60">Changing the profile immediately updates this agent's tool permissions.</p>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Profile</span></div>
+        <select name="profile_id" class="select select-bordered">
+          <option value="p1">Default</option>
+          <option value="p2" selected>Read Only</option>
+          <option value="p3">Full Access</option>
+          <option value="p4">CI Profile</option>
+        </select>
+      </label>
+      <div class="modal-action mt-2">
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('modal-change-profile').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Change profile</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<!-- Add override modal -->
+<dialog id="modal-add-override" class="modal">
+  <div class="modal-box w-full max-w-lg">
+    <h3 class="font-bold text-lg mb-4">Add tool override</h3>
+    <form method="POST" action="/ui/agents/{{ id }}/overrides" class="flex flex-col gap-3">
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Tool name</span></div>
+        <input type="text" name="tool_name" placeholder="gmail__send_email" class="input input-bordered font-mono text-sm" required>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Decision</span></div>
+        <select name="allowed" class="select select-bordered">
+          <option value="true">Allow</option>
+          <option value="false">Deny</option>
+        </select>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Type</span></div>
+        <select name="kind" class="select select-bordered" id="override-kind" onchange="onKindChange()">
+          <option value="static">Static — permanent override</option>
+          <option value="until">Time-bounded — expires at a specific time</option>
+          <option value="uses">Use-count — expires after N uses</option>
+        </select>
+      </label>
+      <div id="override-until" class="hidden form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Expires at</span></div>
+        <input type="datetime-local" name="expires_at" class="input input-bordered">
+      </div>
+      <div id="override-uses" class="hidden form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Number of uses</span></div>
+        <input type="number" name="remaining" min="1" placeholder="10" class="input input-bordered">
+      </div>
+      <div class="modal-action mt-2">
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('modal-add-override').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add override</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+function onKindChange() {
+  var kind = document.getElementById('override-kind').value;
+  document.getElementById('override-until').classList.toggle('hidden', kind !== 'until');
+  document.getElementById('override-uses').classList.toggle('hidden', kind !== 'uses');
+}
+function confirmRevoke() {
+  if (confirm('Revoke all active tokens for ' + '{{ name }}' + '? The agent will need to re-authenticate.')) {
+    document.getElementById('form-revoke').submit();
+  }
+}
+</script>
+<form id="form-revoke" method="POST" action="/ui/agents/{{ id }}/revoke-tokens" class="hidden"></form>
+{% endblock %}
