@@ -1,10 +1,11 @@
 [workspace]
 members = [
-    "crates/mcpshield-core",
-    "crates/mcpshield-db",
-    "crates/mcpshield-db-sqlite",
-    "crates/mcpshield-policy-db",
-    "crates/mcpshield-standard",
-    "crates/mcpshield-test-support",
+    "crates/mcpcondor-core",
+    "crates/mcpcondor-db",
+    "crates/mcpcondor-db-sqlite",
+    "crates/mcpcondor-policy-db",
+    "crates/mcpcondor-standard",
+    "crates/mcpcondor-ui",
+    "crates/mcpcondor-test-support",
 ]
 resolver = "2"

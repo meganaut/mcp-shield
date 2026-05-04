@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
+{% block mob_dashboard %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Page header -->
+  <div>
+    <h2 class="text-2xl font-bold">Dashboard</h2>
+    <p class="text-base-content/60 text-sm mt-1">Overview of your MCPCondor gateway</p>
+  </div>
+
+  <!-- Stat cards -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="stat bg-base-100 rounded-box shadow-sm">
+      <div class="stat-figure text-success">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+        </svg>
+      </div>
+      <div class="stat-title text-xs">Integrations</div>
+      <div class="stat-value text-2xl">{{ stats.integrations_connected }}</div>
+      <div class="stat-desc">{{ stats.integrations_total }} registered</div>
+    </div>
+    <div class="stat bg-base-100 rounded-box shadow-sm">
+      <div class="stat-figure text-info">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17H3a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2h-2"/>
+        </svg>
+      </div>
+      <div class="stat-title text-xs">Agents</div>
+      <div class="stat-value text-2xl">{{ stats.agents_active }}</div>
+      <div class="stat-desc">{{ stats.agents_total }} registered</div>
+    </div>
+    <div class="stat bg-base-100 rounded-box shadow-sm">
+      <div class="stat-figure text-primary">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+        </svg>
+      </div>
+      <div class="stat-title text-xs">Tool calls today</div>
+      <div class="stat-value text-2xl">{{ stats.calls_today }}</div>
+      <div class="stat-desc">{{ stats.calls_denied_today }} denied</div>
+    </div>
+    <div class="stat bg-base-100 rounded-box shadow-sm">
+      <div class="stat-figure text-warning">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+        </svg>
+      </div>
+      <div class="stat-title text-xs">Profiles</div>
+      <div class="stat-value text-2xl">{{ stats.profiles_total }}</div>
+      <div class="stat-desc">permission profiles</div>
+    </div>
+  </div>
+
+  <!-- Recent audit events -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Recent activity</h3>
+        <a href="/ui/audit" class="btn btn-ghost btn-xs">View all</a>
+      </div>
+      {% if recent_events.is_empty() %}
+      <div class="py-8 text-center text-base-content/40 text-sm">No activity yet</div>
+      {% else %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr class="text-xs text-base-content/60">
+              <th>Time</th>
+              <th>Agent</th>
+              <th>Tool</th>
+              <th>Outcome</th>
+              <th class="hidden md:table-cell">Latency</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for event in recent_events %}
+            <tr class="hover">
+              <td class="text-xs text-base-content/60 whitespace-nowrap">{{ event.time_ago }}</td>
+              <td class="text-sm font-medium">{{ event.agent_name }}</td>
+              <td class="text-sm font-mono text-xs">{{ event.operation_name }}</td>
+              <td>
+                {% if event.outcome == "allowed" %}
+                <span class="badge badge-success badge-sm">allowed</span>
+                {% else if event.outcome.starts_with("denied") %}
+                <span class="badge badge-error badge-sm">denied</span>
+                {% else %}
+                <span class="badge badge-warning badge-sm">error</span>
+                {% endif %}
+              </td>
+              <td class="hidden md:table-cell text-xs text-base-content/60">{{ event.latency_ms }}ms</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}

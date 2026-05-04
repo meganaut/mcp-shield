@@ -1,14 +1,14 @@
-# MCPShield
+# MCPCondor
 
 **MCP Governance Gateway**
 
-MCPShield is an open source, self-hostable governance gateway for the Model Context Protocol. It sits between any MCP-compatible AI agent and the external tools and services that agent is permitted to use — enforcing access policies, scanning for sensitive data, and logging every operation.
+MCPCondor is an open source, self-hostable governance gateway for the Model Context Protocol. It sits between any MCP-compatible AI agent and the external tools and services that agent is permitted to use — enforcing access policies, scanning for sensitive data, and logging every operation.
 
-MCPShield works with any MCP-compatible client. It makes no assumptions about which LLM or agent runtime is in use.
+MCPCondor works with any MCP-compatible client. It makes no assumptions about which LLM or agent runtime is in use.
 
 ## The problem
 
-MCP access is currently binary: an agent is connected to a service or it is not. There is no way to say that an agent may read email but not send, or that an automated agent may create calendar events but not delete them, or that tool responses must be scanned for credentials before entering the agent's context. MCPShield provides this governance layer, self-hosted in your own infrastructure.
+MCP access is currently binary: an agent is connected to a service or it is not. There is no way to say that an agent may read email but not send, or that an automated agent may create calendar events but not delete them, or that tool responses must be scanned for credentials before entering the agent's context. MCPCondor provides this governance layer, self-hosted in your own infrastructure.
 
 ## How it works
 
@@ -17,13 +17,13 @@ MCP-compatible agent (any client)
         |
         |  MCP protocol
         |
-  [MCPShield Gateway]
+  [MCPCondor Gateway]
         |-- Policy Engine      ✓ deny by default, per-tool allow rules
         |-- OAuth Server       ✓ issues tokens to agents (OAuth2/PKCE)
-        |-- Admin API          ✓ manage agents and policies
+        |-- Admin API          ✓ manage agents, policies, token revocation
+        |-- Audit Logger       ✓ every tool call logged (allowed/denied/error)
         |-- Credential Vault   (planned) downstream OAuth tokens, encrypted at rest
         |-- DLP Pipeline       (planned) scan params + responses, redact secrets
-        |-- Audit Logger       (planned) every call logged, allowed or denied
         |-- Web UI             (planned) management dashboard
         |
         |  Outbound HTTPS
@@ -31,7 +31,7 @@ MCP-compatible agent (any client)
   Gmail API   Google Calendar API   Slack API   Any OAuth MCP Server
 ```
 
-The agent connects to MCPShield as if it were a single MCP server. MCPShield proxies permitted tool calls to the appropriate downstream service using stored credentials — the agent never handles OAuth tokens directly.
+The agent connects to MCPCondor as if it were a single MCP server. MCPCondor proxies permitted tool calls to the appropriate downstream service using stored credentials — the agent never handles OAuth tokens directly.
 
 ## Roadmap
 
@@ -73,49 +73,50 @@ A multi-user, organisation-scale edition built on the same core.
 
 ## Crate architecture
 
-MCPShield is structured as a Cargo workspace with strict abstraction boundaries. Each crate depends only on traits, never on concrete implementations — concrete types are wired together only at the composition root (`server.rs`).
+MCPCondor is structured as a Cargo workspace with strict abstraction boundaries. Each crate depends only on traits, never on concrete implementations — concrete types are wired together only at the composition root (`server.rs`).
 
 ```
-mcpshield-core
+mcpcondor-core
   MCP protocol types, JsonRpc types
   Traits: PolicyEngine, AuditSink
   No I/O deps
 
-mcpshield-db
+mcpcondor-db
   Trait: Store (all persistence operations)
-  Data types: OAuthClient, AuthCode, AccessToken, PolicyRule
+  Data types: OAuthClient, AuthCode, AccessToken, PolicyRule, AuditEventRow
   No database deps — pure Rust
 
-mcpshield-db-sqlite
+mcpcondor-db-sqlite
   SqliteStore: impl Store
-  Owns all sqlx queries and SQLite migrations
-  SQLite-specific; swap for mcpshield-db-pg to target PostgreSQL
+  Owns all sqlx queries and SQLite migrations (including audit_events table)
+  SQLite-specific; swap for mcpcondor-db-pg to target PostgreSQL
 
-mcpshield-db-pg  (future)
+mcpcondor-db-pg  (future)
   PostgresStore: impl Store
   Drop-in replacement for enterprise deployments
 
-mcpshield-policy-db
+mcpcondor-policy-db
   DbPolicyEngine: impl PolicyEngine
   Per-call evaluation: calls store.get_policy_rule()
   tools/list batch evaluation: overrides list_allowed_boxed() with a single
     store.list_policy_rules() call — O(1) queries regardless of tool count
-  Depends only on mcpshield-core + mcpshield-db (traits); no SQL, no DB dep
+  Depends only on mcpcondor-core + mcpcondor-db (traits); no SQL, no DB dep
 
-mcpshield-standard
+mcpcondor-standard
   Axum handlers, OAuth2/PKCE server, MCP proxy, admin API
-  Holds Arc<dyn Store> + Arc<dyn PolicyEngine> in AppState
+  Holds Arc<dyn Store> + Arc<dyn PolicyEngine> + Arc<dyn AuditSink> in AppState
+  DbAuditSink: impl AuditSink — writes to audit_events via Arc<dyn Store>
   Separate rate limiters for OAuth and admin endpoints
   Peer IP from ConnectInfo<SocketAddr> — X-Forwarded-For headers not trusted
   No sqlx, no knowledge of SQLite or PostgreSQL
   server.rs is the composition root: the only place that
-  imports mcpshield-db-sqlite and mcpshield-policy-db
+  imports mcpcondor-db-sqlite and mcpcondor-policy-db
 
-mcpshield-test-support
+mcpcondor-test-support
   Mock MCP server for integration tests
 ```
 
-This means adding a PostgreSQL backend, an OPA-based policy engine, or a DynamoDB audit sink is a matter of adding a new crate — no changes to `mcpshield-standard` or `mcpshield-core`.
+This means adding a PostgreSQL backend, an OPA-based policy engine, or a DynamoDB audit sink is a matter of adding a new crate — no changes to `mcpcondor-standard` or `mcpcondor-core`.
 
 ## Security properties
 
@@ -127,10 +128,15 @@ This means adding a PostgreSQL backend, an OPA-based policy engine, or a DynamoD
 - **TLS private key** — written with mode `0o600`; world-readable key files are refused at startup
 - **Argon2id** — admin password and client secrets hashed with Argon2id; inputs capped at 1 KiB
 - **Agent isolation** — deleting an agent removes its OAuth client, all access tokens, auth codes, and policy rules in a single transaction
+- **Downstream body cap** — response bodies from downstream MCP servers are capped at 16 MiB before deserialisation; a compromised upstream cannot OOM the gateway
+- **Per-agent session cap** — each agent is limited to 10 concurrent sessions; a single compromised agent cannot exhaust the global session pool
+- **OAuth flow retry limit** — five consecutive credential failures on the same authorization flow redirect with `access_denied`, preventing indefinite brute-force attempts
+- **Token revocation** — `DELETE /admin/agents/{id}/tokens` revokes all active tokens for an agent without deleting its registration
+- **Structured audit log** — every tool call (allowed, denied, or error) is persisted to SQLite with agent ID, operation name, outcome, and latency
 
 ## Status
 
-The core gateway, OAuth2/PKCE server, policy engine, and admin API are implemented and security-hardened. Credential vault, DLP pipeline, audit logging, and Web UI are not yet built.
+The core gateway, OAuth2/PKCE server, policy engine, admin API, and audit logging are implemented and security-hardened. The gateway currently supports a single downstream MCP server configured at startup. Credential vault, DLP pipeline, multi-integration support, and Web UI are not yet built.
 
 Not ready for use.
 

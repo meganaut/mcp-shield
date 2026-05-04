@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Profiles{% endblock %}
+{% block nav_profiles %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="text-2xl font-bold">Profiles</h2>
+      <p class="text-base-content/60 text-sm mt-1">Reusable permission baselines assigned to agents</p>
+    </div>
+    <button class="btn btn-primary btn-sm" onclick="document.getElementById('modal-add-profile').showModal()">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+      </svg>
+      New profile
+    </button>
+  </div>
+
+  <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+    {% for p in profiles %}
+    <div class="card bg-base-100 shadow-sm hover:shadow-md transition-shadow">
+      <div class="card-body gap-3">
+        <div class="flex items-start justify-between gap-2">
+          <div class="flex items-center gap-2">
+            <h3 class="font-semibold text-base">{{ p.name }}</h3>
+            {% if p.is_default %}
+            <span class="badge badge-primary badge-sm">Default</span>
+            {% endif %}
+          </div>
+          <div class="dropdown dropdown-end">
+            <button tabindex="0" class="btn btn-ghost btn-xs btn-square">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"/>
+              </svg>
+            </button>
+            <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-10 w-44 p-1 shadow-lg border border-base-300 text-sm">
+              <li><a href="/ui/profiles/{{ p.id }}">Edit rules</a></li>
+              <li><a>Clone</a></li>
+              {% if !p.is_default %}
+              <li class="text-error"><a class="text-error">Delete</a></li>
+              {% endif %}
+            </ul>
+          </div>
+        </div>
+
+        {% if let Some(desc) = p.description %}
+        <p class="text-sm text-base-content/60">{{ desc }}</p>
+        {% endif %}
+
+        <div class="flex items-center gap-2 mt-1">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-base-content/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17H3a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2h-2"/>
+          </svg>
+          <span class="text-sm text-base-content/60">{{ p.agent_count }} agent{% if p.agent_count != 1 %}s{% endif %}</span>
+        </div>
+
+        <div class="card-actions justify-end mt-1">
+          <a href="/ui/profiles/{{ p.id }}" class="btn btn-ghost btn-sm">Edit rules →</a>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+</div>
+
+<!-- Add profile modal -->
+<dialog id="modal-add-profile" class="modal">
+  <div class="modal-box w-full max-w-lg">
+    <h3 class="font-bold text-lg mb-4">New profile</h3>
+    <form method="POST" action="/ui/profiles" class="flex flex-col gap-3">
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Profile name</span></div>
+        <input type="text" name="name" placeholder="Read Only" class="input input-bordered" required>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Description</span><span class="label-text-alt text-base-content/50">Optional</span></div>
+        <input type="text" name="description" placeholder="…" class="input input-bordered">
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Start from</span></div>
+        <select name="clone_from" class="select select-bordered">
+          <option value="">Blank — no permissions</option>
+          <option value="default">Clone: Default</option>
+          <option value="readonly">Clone: Read Only</option>
+          <option value="full">Clone: Full Access</option>
+        </select>
+      </label>
+      <div class="modal-action mt-2">
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('modal-add-profile').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create profile</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+{% endblock %}

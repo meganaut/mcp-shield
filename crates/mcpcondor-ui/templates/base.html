@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" id="html-root">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}MCPCondor{% endblock %} — MCPCondor</title>
+  <link rel="stylesheet" href="/assets/daisyui.css">
+  <script src="/assets/tailwind.js"></script>
+  <script>
+    // Restore theme + density from localStorage before first paint
+    (function() {
+      var theme = localStorage.getItem('mcpcondor-theme') || 'system';
+      var density = localStorage.getItem('mcpcondor-density') || 'normal';
+      var root = document.getElementById('html-root');
+      if (theme === 'dark') root.setAttribute('data-theme', 'dark');
+      else if (theme === 'light') root.setAttribute('data-theme', 'light');
+      else if (window.matchMedia('(prefers-color-scheme: dark)').matches) root.setAttribute('data-theme', 'dark');
+      if (density === 'compact') root.classList.add('density-compact');
+    })();
+  </script>
+  <style>
+    /* Compact density: tighter table rows and padding */
+    .density-compact .table td,
+    .density-compact .table th { padding-top: 0.35rem; padding-bottom: 0.35rem; }
+    .density-compact .card-body { padding: 0.75rem 1rem; }
+  </style>
+</head>
+<body class="bg-base-200 min-h-screen">
+
+  <!-- Navbar -->
+  <div class="navbar bg-base-100 border-b border-base-300 px-4 sticky top-0 z-50">
+    <div class="navbar-start">
+      <a href="/ui" class="flex items-center gap-2 font-bold text-lg text-primary">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 100 100">
+          <path d="M36,50 A16,16 0 0,1 64,50" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round"/>
+          <path d="M28,46 A24,24 0 0,1 72,46" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" opacity="0.5"/>
+          <path d="M40,52 C28,46 14,38 4,34 L2,38 L9,42 L2,46 L9,50 L3,54 C12,60 28,62 40,60Z" fill="currentColor"/>
+          <path d="M60,52 C72,46 86,38 96,34 L98,38 L91,42 L98,46 L91,50 L97,54 C88,60 72,62 60,60Z" fill="currentColor"/>
+          <ellipse cx="50" cy="56" rx="16" ry="12" fill="white"/>
+          <circle cx="50" cy="56" r="10" fill="currentColor"/>
+          <circle cx="50" cy="56" r="5" fill="#1e1b4b"/>
+          <path d="M44,70 L35,88 L43,80 L48,86 L50,81 L52,86 L57,80 L65,88 L56,70Z" fill="currentColor"/>
+        </svg>
+        MCPCondor
+      </a>
+    </div>
+    <div class="navbar-center hidden md:flex">
+      <ul class="menu menu-horizontal gap-1 text-sm">
+        <li><a href="/ui" class="{% block nav_dashboard %}{% endblock %}">Dashboard</a></li>
+        <li><a href="/ui/integrations" class="{% block nav_integrations %}{% endblock %}">Integrations</a></li>
+        <li><a href="/ui/agents" class="{% block nav_agents %}{% endblock %}">Agents</a></li>
+        <li><a href="/ui/profiles" class="{% block nav_profiles %}{% endblock %}">Profiles</a></li>
+        <li><a href="/ui/audit" class="{% block nav_audit %}{% endblock %}">Audit Log</a></li>
+      </ul>
+    </div>
+    <div class="navbar-end gap-1">
+      <!-- Settings dropdown -->
+      <div class="dropdown dropdown-end">
+        <button tabindex="0" class="btn btn-ghost btn-sm btn-square" title="Settings">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+        </button>
+        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-50 w-48 p-2 shadow-lg border border-base-300 text-sm">
+          <li class="menu-title text-xs opacity-50 pb-1">Appearance</li>
+          <li>
+            <a onclick="toggleTheme(); document.activeElement.blur()" class="flex items-center gap-2">
+              <svg id="theme-icon-dark" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+              <svg id="theme-icon-light" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+              </svg>
+              <span id="theme-label">Light mode</span>
+            </a>
+          </li>
+          <li>
+            <a onclick="toggleDensity(); document.activeElement.blur()" class="flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+              <span id="density-label">Compact view</span>
+            </a>
+          </li>
+        </ul>
+      </div>
+      <!-- Logout -->
+      <form method="POST" action="/ui/logout">
+        <button class="btn btn-ghost btn-sm">Logout</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Mobile bottom nav -->
+  <div class="btm-nav btm-nav-sm md:hidden z-50">
+    <a href="/ui" class="{% block mob_dashboard %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg></a>
+    <a href="/ui/integrations" class="{% block mob_integrations %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg></a>
+    <a href="/ui/agents" class="{% block mob_agents %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17H3a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2h-2"/></svg></a>
+    <a href="/ui/audit" class="{% block mob_audit %}{% endblock %}"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg></a>
+  </div>
+
+  <!-- Page content -->
+  <main class="container mx-auto max-w-7xl px-4 py-6 pb-20 md:pb-6">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/assets/htmx.min.js"></script>
+  <script>
+    function syncThemeUI() {
+      var isDark = document.getElementById('html-root').getAttribute('data-theme') === 'dark';
+      document.getElementById('theme-icon-dark').classList.toggle('hidden', !isDark);
+      document.getElementById('theme-icon-light').classList.toggle('hidden', isDark);
+      document.getElementById('theme-label').textContent = isDark ? 'Light mode' : 'Dark mode';
+    }
+    function syncDensityUI() {
+      var compact = document.getElementById('html-root').classList.contains('density-compact');
+      document.getElementById('density-label').textContent = compact ? 'Normal view' : 'Compact view';
+    }
+    function toggleTheme() {
+      var root = document.getElementById('html-root');
+      var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      localStorage.setItem('mcpcondor-theme', next);
+      syncThemeUI();
+    }
+    function toggleDensity() {
+      var root = document.getElementById('html-root');
+      root.classList.toggle('density-compact');
+      localStorage.setItem('mcpcondor-density', root.classList.contains('density-compact') ? 'compact' : 'normal');
+      syncDensityUI();
+    }
+    syncThemeUI();
+    syncDensityUI();
+  </script>
+</body>
+</html>

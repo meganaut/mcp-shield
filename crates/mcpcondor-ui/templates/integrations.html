@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Integrations{% endblock %}
+{% block nav_integrations %}active{% endblock %}
+{% block mob_integrations %}active{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between">
+    <div>
+      <h2 class="text-2xl font-bold">Integrations</h2>
+      <p class="text-base-content/60 text-sm mt-1">Downstream MCP servers this gateway proxies to</p>
+    </div>
+    <button class="btn btn-primary btn-sm" onclick="document.getElementById('modal-add-integration').showModal()">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+      </svg>
+      Add integration
+    </button>
+  </div>
+
+  <!-- Search -->
+  <label class="input input-bordered flex items-center gap-2 max-w-sm">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-base-content/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+    </svg>
+    <input type="text" placeholder="Search integrations…" class="grow" id="integration-search" oninput="filterTable(this, 'integrations-table')">
+  </label>
+
+  <!-- Table -->
+  {% if integrations.is_empty() %}
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body items-center py-16 text-center">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-base-content/20 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+      </svg>
+      <p class="font-semibold">No integrations yet</p>
+      <p class="text-base-content/60 text-sm">Add your first integration to get started</p>
+      <button class="btn btn-primary btn-sm mt-4" onclick="document.getElementById('modal-add-integration').showModal()">Add integration</button>
+    </div>
+  </div>
+  {% else %}
+  <div class="card bg-base-100 shadow-sm overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="table" id="integrations-table">
+        <thead>
+          <tr class="text-xs text-base-content/60 bg-base-200/50">
+            <th>Name</th>
+            <th>Slug</th>
+            <th>Status</th>
+            <th>Tools</th>
+            <th>Default stance</th>
+            <th class="hidden lg:table-cell">MCP URL</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for i in integrations %}
+          <tr class="hover">
+            <td class="font-medium">{{ i.name }}</td>
+            <td><code class="text-xs bg-base-200 px-1.5 py-0.5 rounded">{{ i.slug }}</code></td>
+            <td>
+              {% if i.connected %}
+              <span class="badge badge-success badge-sm gap-1">
+                <span class="w-1.5 h-1.5 rounded-full bg-current inline-block"></span>
+                Connected
+              </span>
+              {% else %}
+              <span class="badge badge-ghost badge-sm gap-1">
+                <span class="w-1.5 h-1.5 rounded-full bg-base-content/30 inline-block"></span>
+                Not connected
+              </span>
+              {% endif %}
+            </td>
+            <td class="text-sm">
+              {% if i.connected %}{{ i.tool_count }} tools{% else %}<span class="text-base-content/40">—</span>{% endif %}
+            </td>
+            <td>
+              {% if i.default_stance == "allow" %}
+              <span class="badge badge-warning badge-sm">Allow all</span>
+              {% else %}
+              <span class="badge badge-ghost badge-sm">Deny all</span>
+              {% endif %}
+            </td>
+            <td class="hidden lg:table-cell text-xs text-base-content/50 max-w-xs truncate">{{ i.mcp_url }}</td>
+            <td>
+              <div class="flex gap-1 justify-end">
+                {% if !i.connected %}
+                <button class="btn btn-xs btn-primary">Connect</button>
+                {% else %}
+                <button class="btn btn-xs btn-ghost">Refresh</button>
+                {% endif %}
+                <div class="dropdown dropdown-end">
+                  <button tabindex="0" class="btn btn-xs btn-ghost">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"/>
+                    </svg>
+                  </button>
+                  <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-10 w-40 p-1 shadow-lg border border-base-300 text-sm">
+                    <li><a href="/ui/integrations/{{ i.id }}/tools">View tools</a></li>
+                    <li><a>Edit</a></li>
+                    <li class="text-error"><a class="text-error">Delete</a></li>
+                  </ul>
+                </div>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+<!-- Add integration modal -->
+<dialog id="modal-add-integration" class="modal">
+  <div class="modal-box w-full max-w-lg">
+    <h3 class="font-bold text-lg mb-4">Add integration</h3>
+    <form method="POST" action="/ui/integrations" class="flex flex-col gap-3">
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Name</span></div>
+        <input type="text" name="name" placeholder="Gmail" class="input input-bordered" required>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Slug</span>
+          <span class="label-text-alt text-base-content/50">URL-safe, used to namespace tools</span>
+        </div>
+        <input type="text" name="slug" placeholder="gmail" class="input input-bordered font-mono" required pattern="[a-z0-9_-]+">
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">MCP server URL</span></div>
+        <input type="url" name="mcp_url" placeholder="https://…" class="input input-bordered" required>
+      </label>
+      <label class="form-control">
+        <div class="label pb-1"><span class="label-text text-sm font-medium">Default stance</span>
+          <span class="label-text-alt text-base-content/50">What agents can do without explicit rules</span>
+        </div>
+        <select name="default_stance" class="select select-bordered">
+          <option value="deny" selected>Deny all (recommended)</option>
+          <option value="allow">Allow all</option>
+        </select>
+      </label>
+      <div class="modal-action mt-2">
+        <button type="button" class="btn btn-ghost" onclick="document.getElementById('modal-add-integration').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Add integration</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+function filterTable(input, tableId) {
+  var filter = input.value.toLowerCase();
+  var rows = document.getElementById(tableId).querySelectorAll('tbody tr');
+  rows.forEach(function(row) {
+    row.style.display = row.textContent.toLowerCase().includes(filter) ? '' : 'none';
+  });
+}
+</script>
+{% endblock %}

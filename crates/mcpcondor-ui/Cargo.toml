@@ -1,0 +1,15 @@
+[package]
+name = "mcpcondor-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+askama = "0.12"
+axum = "0.8"
+rust-embed = { version = "8", features = ["compression"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "preview"
+path = "src/bin/preview.rs"

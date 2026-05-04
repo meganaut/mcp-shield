@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light" id="html-root">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — MCPCondor</title>
+  <link rel="stylesheet" href="/assets/daisyui.css">
+  <script src="/assets/tailwind.js"></script>
+  <script>
+    (function() {
+      var theme = localStorage.getItem('mcpcondor-theme') || 'system';
+      var root = document.getElementById('html-root');
+      if (theme === 'dark') root.setAttribute('data-theme', 'dark');
+      else if (theme === 'light') root.setAttribute('data-theme', 'light');
+      else if (window.matchMedia('(prefers-color-scheme: dark)').matches) root.setAttribute('data-theme', 'dark');
+    })();
+  </script>
+</head>
+<body class="bg-base-200 min-h-screen flex items-center justify-center">
+  <div class="card w-full max-w-sm bg-base-100 shadow-xl">
+    <div class="card-body gap-4">
+      <div class="flex flex-col items-center gap-2 mb-2">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-primary" viewBox="0 0 100 100">
+          <path d="M36,50 A16,16 0 0,1 64,50" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>
+          <path d="M28,46 A24,24 0 0,1 72,46" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" opacity="0.55"/>
+          <path d="M20,42 A32,32 0 0,1 80,42" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" opacity="0.25"/>
+          <path d="M40,52 C28,46 14,38 4,34 L2,38 L9,42 L2,46 L9,50 L3,54 C12,60 28,62 40,60Z" fill="currentColor"/>
+          <path d="M60,52 C72,46 86,38 96,34 L98,38 L91,42 L98,46 L91,50 L97,54 C88,60 72,62 60,60Z" fill="currentColor"/>
+          <ellipse cx="50" cy="56" rx="16" ry="12" fill="white"/>
+          <circle cx="50" cy="56" r="10" fill="currentColor"/>
+          <circle cx="50" cy="56" r="5" fill="#1e1b4b"/>
+          <circle cx="54.5" cy="52" r="2.5" fill="white"/>
+          <path d="M44,70 L35,88 L43,80 L48,86 L50,81 L52,86 L57,80 L65,88 L56,70Z" fill="currentColor"/>
+        </svg>
+        <h1 class="text-2xl font-bold">MCPCondor</h1>
+        <p class="text-base-content/60 text-sm">Admin Console</p>
+      </div>
+
+      {% if let Some(error) = error %}
+      <div class="alert alert-error text-sm py-2">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        {{ error }}
+      </div>
+      {% endif %}
+
+      <form method="POST" action="/ui/login" class="flex flex-col gap-3">
+        <label class="form-control">
+          <div class="label pb-1"><span class="label-text text-sm font-medium">Username</span></div>
+          <input type="text" name="username" class="input input-bordered" autocomplete="username" required autofocus>
+        </label>
+        <label class="form-control">
+          <div class="label pb-1"><span class="label-text text-sm font-medium">Password</span></div>
+          <input type="password" name="password" class="input input-bordered" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="btn btn-primary mt-2">Sign in</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>
