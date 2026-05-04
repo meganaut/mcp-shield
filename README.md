@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logo-dark.svg">
+    <img src="logo.svg" width="120" alt="MCPCondor">
+  </picture>
+</p>
+
 # MCPCondor
 
 **MCP Governance Gateway**
